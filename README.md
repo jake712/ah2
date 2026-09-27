@@ -1,3 +1,5 @@
+Alpine 一鍵安裝Hysteria 2
+
 port 輸入你的端口
 password 輸入你的hy2密碼
 ```
