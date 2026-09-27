@@ -23,17 +23,15 @@ apk add bash curl openssl tar
 # 3. 下載並安裝 Hysteria 二進位檔案
 echo -e "${GREEN}[2/6] 下載 Hysteria 主程式...${NC}"
 mkdir -p /usr/local/bin
-curl -fsSL https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -o /usr/local/bin/hysteria
+curl -fsSL https://github.com -o /usr/local/bin/hysteria
 chmod +x /usr/local/bin/hysteria
 /usr/local/bin/hysteria version
 
-# 4. 生成自簽名證書
+# 4. 生成自簽名證書 (已修正語法以完美相容 Alpine 環境)
 echo -e "${GREEN}[3/6] 生成自簽名 SSL 證書...${NC}"
 mkdir -p /etc/ssl/private
-openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-  -keyout "/etc/ssl/private/bing.key" \
-  -out "/etc/ssl/private/bing.crt" \
-  -days 3650 -subj "/CN=bing.com"
+openssl ecparam -name prime256v1 -genkey -noout -out /etc/ssl/private/bing.key
+openssl req -x509 -nodes -key /etc/ssl/private/bing.key -out /etc/ssl/private/bing.crt -days 3650 -subj "/CN=bing.com"
 chmod -R 777 /etc/ssl/private
 
 # 5. 建立配置文件
