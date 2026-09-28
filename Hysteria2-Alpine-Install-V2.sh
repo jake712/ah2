@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.4 - 自動密碼版
+# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.5 - 智慧 SSH 連線 IP 版
 # 用法: ./hysteria2-alpine-install.sh -p [端口] -w "你的密碼" -i "你的入口IP"
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
@@ -45,7 +45,7 @@ else
   HY_PORT=$CUSTOM_PORT
 fi
 
-# 密碼處理：移除強制輸入提示，未指定則全自動生成
+# 密碼處理：全自動生成
 if [ -z "$CUSTOM_PASSWORD" ]; then
   HY_PASS=$(gen_password)
   echo -e "${YELLOW}未指定密碼，已自動生成隨機密碼: $HY_PASS${PLAIN}"
@@ -54,7 +54,7 @@ else
 fi
 
 echo -e "${GREEN}=== 開始安裝 Hysteria 2 ===${PLAIN}"
-echo -e "端口: $HY_PORT 密碼: $HY_PASS 入口IP參數: ${CUSTOM_IP:-自動檢測}"
+echo -e "端口: $HY_PORT 密碼: $HY_PASS"
 
 echo -e "${YELLOW}[1/6] 安裝依賴...${PLAIN}"
 apk update
@@ -118,7 +118,7 @@ quic:
   maxConnReceiveWindow: 20971520
 EOF
 
-# 5. 服務 (優化 PID 路徑與 OpenRC 權限管理)
+# 5. 服務
 cat > /etc/init.d/hysteria <<'SERVICE_EOF'
 #!/sbin/openrc-run
 name="Hysteria 2 Service"
@@ -146,14 +146,13 @@ echo -e "${YELLOW}[6/6] 啟動服務...${PLAIN}"
 rc-service hysteria restart || rc-service hysteria start
 sleep 2
 
-# 檢查後台進程是否真正存活
 if ! rc-service hysteria status >/dev/null 2>&1; then
   echo -e "${RED}服務啟動失敗！錯誤日誌如下：${PLAIN}"
   cat /var/log/hysteria.log
   exit 1
 fi
 
-# === 入口IP檢測 ===
+# === 智慧 IP 檢測模組 ===
 get_public_ip() {
   local ip=""
   for api in "https://ifconfig.me" "https://ipinfo.io" "https://ipify.org" "https://icanhazip.com"; do
@@ -167,18 +166,34 @@ get_default_ip() {
   ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1
 }
 
+# 獲取當前 SSH 階段的伺服器端 IP
+get_ssh_server_ip() {
+  if [ -n "$SSH_CONNECTION" ]; then
+    echo "$SSH_CONNECTION" | awk '{print $3}'
+  else
+    echo ""
+  fi
+}
+
 if [ -n "$CUSTOM_IP" ]; then
   SERVER_IP="$CUSTOM_IP"
   echo -e "${GREEN}使用手動指定的入口IP: $SERVER_IP${PLAIN}"
 else
-  PUBLIC_IP=$(get_public_ip)
-  LOCAL_IP=$(get_default_ip)
-  echo -e "檢測到 出口公網IP: ${YELLOW}${PUBLIC_IP:-未知}${PLAIN}"
-  echo -e "檢測到 本機默認路由IP: ${YELLOW}${LOCAL_IP:-未知}${PLAIN}"
+  SSH_IP=$(get_ssh_server_ip)
+  if [ -n "$SSH_IP" ] && [[ "$SSH_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$SSH_IP" != "127.0.0.1" ]; then
+    SERVER_IP="$SSH_IP"
+    echo -e "${GREEN}智慧檢測：成功自動提取當前 SSH 連線的目的地 IP: $SERVER_IP${PLAIN}"
+  else
+    echo -e "${YELLOW}未檢測到有效 SSH 環境變數，切換至傳統探測模式...${PLAIN}"
+    PUBLIC_IP=$(get_public_ip)
+    LOCAL_IP=$(get_default_ip)
+    echo -e "檢測到 出口公網IP: ${YELLOW}${PUBLIC_IP:-未知}${PLAIN}"
+    echo -e "檢測到 本機默認路由IP: ${YELLOW}${LOCAL_IP:-未知}${PLAIN}"
+    
+    if [ -n "$PUBLIC_IP" ]; then SERVER_IP="$PUBLIC_IP"; else SERVER_IP="$LOCAL_IP"; fi
+  fi
   
-  if [ -n "$PUBLIC_IP" ]; then SERVER_IP="$PUBLIC_IP"; else SERVER_IP="$LOCAL_IP"; fi
   if [ -z "$SERVER_IP" ]; then SERVER_IP="YOUR_SERVER_IP"; fi
-  echo -e "${YELLOW}如果 出口IP != 入口IP，請下次用 -i 參數手動指定${PLAIN}"
 fi
 
 echo ""
