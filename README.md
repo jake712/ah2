@@ -10,6 +10,10 @@ youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
 
 donate: https://jake712.com/?p=120
 
+指定出口IP版
+```
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-Install-V3.sh | bash -s -- -p 端口 -w '密碼' -i 外網網址
+```
 65M小雞要安裝临时建一个 Swap
 
 ```
