@@ -1,56 +1,25 @@
 #!/bin/bash
-# Hysteria 2 一键安装脚本 for Alpine Linux (OpenRC)
-# 支持自定义端口和密码
-# 用法: 
-#   ./hysteria2-alpine-install.sh -p 56764 -w "你的密码"
-#   ./hysteria2-alpine-install.sh (交互式)
-#   PORT=12345 PASSWORD=MyPass123 ./hysteria2-alpine-install.sh
-#   curl -fsSL https://your-domain/install.sh | bash -s -- -p 443 -w MyPass
-
+# Hysteria 2 一键安装脚本 for Alpine Linux V2.1 - 修复入口IP版
+# 用法: ./hysteria2-alpine-install-v2.1.sh -p 56764 -w "你的密码" -i "你的入口IP"
 set -e
-
-# 颜色
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-PLAIN='\033[0m'
-
-# 默认值
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 DEFAULT_PORT=56764
-DEFAULT_PASSWORD=""
 
-# 解析参数
-while getopts "p:w:h" opt; do
+while getopts "p:w:i:h" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
-    h) 
-      echo "用法: $0 [-p 端口] [-w 密码]"
-      echo "  -p  自定义端口 (1-65535), 默认 $DEFAULT_PORT"
-      echo "  -w  自定义密码, 默认随机生成"
-      echo "  环境变量也支持: PORT=xxx PASSWORD=xxx $0"
-      exit 0
-      ;;
-    *) ;;
+    i) CUSTOM_IP=$OPTARG ;;
+    h) echo "用法: $0 [-p 端口] [-w 密码] [-i 入口IP]"; echo "  -p 端口  默认 $DEFAULT_PORT"; echo "  -w 密码  默认随机"; echo "  -i IP    手动指定对外展示的服务器IP (入口IP)"; exit 0 ;;
   esac
 done
 
-# 支持环境变量
 CUSTOM_PORT=${CUSTOM_PORT:-${PORT:-}}
 CUSTOM_PASSWORD=${CUSTOM_PASSWORD:-${PASSWORD:-}}
+CUSTOM_IP=${CUSTOM_IP:-${SERVER_IP:-}}
 
-# 检查 root
-if [ "$(id -u)" != "0" ]; then
-  echo -e "${RED}错误: 请使用 root 用户运行${PLAIN}"
-  exit 1
-fi
+if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-# 检查 Alpine
-if [ ! -f /etc/alpine-release ]; then
-  echo -e "${YELLOW}警告: 未检测到 Alpine 系统，但将继续尝试...${PLAIN}"
-fi
-
-# 获取架构
 get_arch() {
   ARCH=$(uname -m)
   case $ARCH in
@@ -60,67 +29,53 @@ get_arch() {
     *) echo "amd64" ;;
   esac
 }
+gen_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; echo; }
 
-# 生成随机密码
-gen_password() {
-  tr -dc 'A-Za-z0-9!@#$%^&*()_+' < /dev/urandom | head -c 16
-  echo
-}
-
-# 端口处理
-if [ -z "$CUSTOM_PORT" ]; then
-  read -p "请输入 Hysteria 2 端口 [默认 $DEFAULT_PORT]: " input_port
-  HY_PORT=${input_port:-$DEFAULT_PORT}
-else
-  HY_PORT=$CUSTOM_PORT
-fi
-
-# 密码处理
-if [ -z "$CUSTOM_PASSWORD" ]; then
-  read -p "请输入 Hysteria 2 密码 [回车随机生成]: " input_pass
-  if [ -z "$input_pass" ]; then
-    HY_PASS=$(gen_password)
-    echo -e "${YELLOW}已随机生成密码: $HY_PASS${PLAIN}"
-  else
-    HY_PASS=$input_pass
-  fi
-else
-  HY_PASS=$CUSTOM_PASSWORD
-fi
+# 端口密码处理
+if [ -z "$CUSTOM_PORT" ]; then read -p "请输入端口 [默认 $DEFAULT_PORT]: " input_port; HY_PORT=${input_port:-$DEFAULT_PORT}; else HY_PORT=$CUSTOM_PORT; fi
+if [ -z "$CUSTOM_PASSWORD" ]; then read -p "请输入密码 [回车随机生成]: " input_pass; if [ -z "$input_pass" ]; then HY_PASS=$(gen_password); echo -e "${YELLOW}随机密码: $HY_PASS${PLAIN}"; else HY_PASS=$input_pass; fi; else HY_PASS=$CUSTOM_PASSWORD; fi
 
 echo -e "${GREEN}=== 开始安装 Hysteria 2 ===${PLAIN}"
-echo -e "端口: ${GREEN}$HY_PORT${PLAIN}"
-echo -e "密码: ${GREEN}$HY_PASS${PLAIN}"
+echo -e "端口: $HY_PORT 密码: $HY_PASS 入口IP参数: ${CUSTOM_IP:-自动检测}"
 
-# 1. 更新并安装依赖
 echo -e "${YELLOW}[1/6] 安装依赖...${PLAIN}"
 apk update
-apk add --no-cache bash curl openssl tar iproute2
+apk add --no-cache bash curl wget openssl tar iproute2 file
 
-# 2. 安装 Hysteria 2
-echo -e "${YELLOW}[2/6] 下载 Hysteria 2...${PLAIN}"
-ARCH_TYPE=$(get_arch)
-HY_BIN_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH_TYPE}"
+mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log
 
-mkdir -p /usr/local/bin
-echo "下载: $HY_BIN_URL"
-curl -fsSL "$HY_BIN_URL" -o /usr/local/bin/hysteria
-chmod +x /usr/local/bin/hysteria
-/usr/local/bin/hysteria version || { echo -e "${RED}Hysteria 二进制文件下载失败${PLAIN}"; exit 1; }
+# 2. 下载
+echo -e "${YELLOW}[2/6] 下载 Hysteria 2 (自动重试多镜像)...${PLAIN}"
+ARCH_TYPE=$(get_arch); BIN_NAME="hysteria-linux-${ARCH_TYPE}"; DEST="/usr/local/bin/hysteria"
+URLS=(
+"https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
+"https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
+"https://ghproxy.com/https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
+)
+download_success=0
+for URL in "${URLS[@]}"; do
+  echo -e " 尝试: $URL"
+  rm -f "$DEST" /tmp/hy.download
+  if curl -fL --connect-timeout 10 --max-time 60 -o /tmp/hy.download "$URL" 2>&1; then
+    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML，跳过"; continue; fi
+    if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 不是ELF"; continue; fi
+    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 太小 $SIZE"; continue; fi
+    mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功 ($SIZE bytes)${PLAIN}"; break
+  else
+    echo -e "${RED} -> 失败，试下一个${PLAIN}"
+  fi
+done
+if [ "$download_success" -ne 1 ]; then echo -e "${RED}所有镜像失败${PLAIN}"; exit 1; fi
+"$DEST" version
 
-# 3. 生成自签名证书
-echo -e "${YELLOW}[3/6] 生成 TLS 证书 (CN=bing.com)...${PLAIN}"
-mkdir -p /etc/ssl/private
-# 更兼容的写法，不使用 <() 进程替换
+# 3. 证书
+echo -e "${YELLOW}[3/6] 生成 TLS 证书...${PLAIN}"
 openssl ecparam -genkey -name prime256v1 -noout -out /etc/ssl/private/bing.key
 openssl req -new -x509 -nodes -key /etc/ssl/private/bing.key -out /etc/ssl/private/bing.crt -days 3650 -subj "/CN=bing.com"
-chmod 600 /etc/ssl/private/bing.key
-chmod 644 /etc/ssl/private/bing.crt
+chmod 600 /etc/ssl/private/bing.key; chmod 644 /etc/ssl/private/bing.crt
 
-# 4. 生成配置文件
+# 4. 配置
 echo -e "${YELLOW}[4/6] 生成配置文件...${PLAIN}"
-mkdir -p /etc/hysteria
-
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${HY_PORT}
 
@@ -130,30 +85,24 @@ tls:
 
 auth:
   type: password
-  password: "${HY_PASS}"
-
-# 忽略客户端带宽限制，性能更好
-ignoreClientBandwidth: true
-
-# 可选优化
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
+  password: ${HY_PASS}
 
 masquerade:
   type: proxy
   proxy:
     url: https://bing.com
     rewriteHost: true
+
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
 EOF
 
-# 5. 创建 OpenRC 服务
-echo -e "${YELLOW}[5/6] 创建 OpenRC 服务...${PLAIN}"
+# 5. 服务
 cat > /etc/init.d/hysteria <<'SERVICE_EOF'
 #!/sbin/openrc-run
-
 name="Hysteria 2 Service"
 description="Hysteria 2 Proxy Server"
 command="/usr/local/bin/hysteria"
@@ -162,65 +111,66 @@ command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/hysteria.log"
 error_log="/var/log/hysteria.log"
-
 depend() {
-    need net
-    after firewall
+  need net
+  after firewall
 }
-
 start_pre() {
-    checkpath --directory --mode 0755 /run
-    checkpath --file --mode 0644 /var/log/hysteria.log
+  checkpath --directory --mode 0755 /run
+  checkpath --file --mode 0644 /var/log/hysteria.log
 }
 SERVICE_EOF
-
 chmod +x /etc/init.d/hysteria
 rc-update add hysteria default
 
-# 6. 启动服务
+# 6. 启动
 echo -e "${YELLOW}[6/6] 启动服务...${PLAIN}"
 rc-service hysteria restart || rc-service hysteria start
 sleep 2
-rc-service hysteria status
+rc-service hysteria status || cat /var/log/hysteria.log
 
-# 获取公网 IP
-get_ip() {
-  IP=$(curl -4 -s --max-time 3 https://ifconfig.me || curl -4 -s --max-time 3 https://ipinfo.io/ip || echo "YOUR_SERVER_IP")
-  echo "$IP"
+# === 核心修复：入口IP检测 ===
+get_public_ip() {
+  local ip=""
+  for api in "https://ifconfig.me" "https://ipinfo.io/ip" "https://api.ipify.org" "https://icanhazip.com"; do
+    ip=$(curl -4 -s --max-time 5 "$api" 2>/dev/null | tr -d ' \r\n' | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -n1)
+    if [ -n "$ip" ]; then echo "$ip"; return; fi
+  done
+  echo ""
 }
-SERVER_IP=$(get_ip)
+get_default_ip() {
+  ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -n1
+}
+
+if [ -n "$CUSTOM_IP" ]; then
+  SERVER_IP="$CUSTOM_IP"
+  echo -e "${GREEN}使用手动指定的入口IP: $SERVER_IP${PLAIN}"
+else
+  PUBLIC_IP=$(get_public_ip)
+  LOCAL_IP=$(get_default_ip)
+  echo -e "检测到 出口公网IP: ${YELLOW}${PUBLIC_IP:-未知}${PLAIN}"
+  echo -e "检测到 本机默认路由IP: ${YELLOW}${LOCAL_IP:-未知}${PLAIN}"
+  # 优先用公网IP，如果拿不到就用本地IP
+  if [ -n "$PUBLIC_IP" ]; then SERVER_IP="$PUBLIC_IP"; else SERVER_IP="$LOCAL_IP"; fi
+  if [ -z "$SERVER_IP" ]; then SERVER_IP="YOUR_SERVER_IP"; fi
+  echo -e "${YELLOW}如果 出口IP != 入口IP，请下次用 -i 参数手动指定: curl ... | bash -s -- -p $HY_PORT -w '$HY_PASS' -i 你的入口IP${PLAIN}"
+fi
 
 echo ""
 echo -e "${GREEN}========== 安装完成 ==========${PLAIN}"
-echo -e "监听端口: ${GREEN}${HY_PORT} (UDP)${PLAIN}"
-echo -e "认证密码: ${GREEN}${HY_PASS}${PLAIN}"
-echo -e "配置文件: ${GREEN}/etc/hysteria/config.yaml${PLAIN}"
-echo -e "证书: ${GREEN}/etc/ssl/private/bing.crt${PLAIN}"
-echo -e "服务管理: ${GREEN}rc-service hysteria [start|stop|restart|status]${PLAIN}"
+echo -e "端口: ${GREEN}${HY_PORT}/udp${PLAIN} 密码: ${GREEN}${HY_PASS}${PLAIN}"
+echo -e "配置: /etc/hysteria/config.yaml"
+echo -e "管理: rc-service hysteria restart"
 echo ""
-echo -e "${YELLOW}客户端配置 (config.yaml 示例):${PLAIN}"
-cat <<CLIENT_EOF
-
-server: ${SERVER_IP}:${HY_PORT}
-auth: ${HY_PASS}
-tls:
-  sni: bing.com
-  insecure: true
-bandwidth:
-  up: 100 mbps
-  down: 100 mbps
-socks5:
-  listen: 127.0.0.1:1080
-http:
-  listen: 127.0.0.1:8080
-
-CLIENT_EOF
-
-echo -e "${YELLOW}Hysteria 2 分享链接 (URI):${PLAIN}"
-# URL encode 密码中的特殊字符，简单处理
-ENCODED_PASS=$(echo -n "$HY_PASS" | jq -sRr @uri 2>/dev/null || echo "$HY_PASS")
-echo -e "${GREEN}hysteria2://${ENCODED_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2${PLAIN}"
+echo -e "客户端 YAML:"
+echo "server: ${SERVER_IP}:${HY_PORT}"
+echo "auth: ${HY_PASS}"
+echo "tls:"
+echo "  sni: bing.com"
+echo "  insecure: true"
 echo ""
-echo -e "${YELLOW}注意: 请在防火墙/安全组放行 UDP ${HY_PORT} 端口${PLAIN}"
-echo -e "查看日志: ${GREEN}cat /var/log/hysteria.log${PLAIN}"
+echo -e "URI:"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2${PLAIN}"
 echo ""
+echo -e "${YELLOW}记得放行防火墙 UDP ${HY_PORT}${PLAIN}"
+echo -e "${YELLOW}如果服务器有多个IP或用了WARP，请确认 ${SERVER_IP} 是你SSH连接的那个IP，不是WARP的IP${PLAIN}"
