@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.5 - 智慧 SSH 連線 IP 版
+# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.6 - 低記憶體優化版
 # 用法: ./hysteria2-alpine-install.sh -p [端口] -w "你的密碼" -i "你的入口IP"
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
@@ -18,6 +18,12 @@ CUSTOM_PASSWORD=${CUSTOM_PASSWORD:-${PASSWORD:-}}
 CUSTOM_IP=${CUSTOM_IP:-${SERVER_IP:-}}
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}請用 root 運行${PLAIN}"; exit 1; fi
+
+# 低記憶體預警檢查 (Swap 檢查)
+TOTAL_SWAP=$(free -m | awk '/Swap/ {print $2}')
+if [ "${TOTAL_SWAP:-0}" -eq 0 ]; then
+  echo -e "${YELLOW}[提示] 檢測到系統未啟用 Swap 虛擬記憶體。如果是極低記憶體(如128MB/256MB)環境，接下來可能還會被系統 Killed。${PLAIN}"
+fi
 
 get_arch() {
   ARCH=$(uname -m)
@@ -56,9 +62,14 @@ fi
 echo -e "${GREEN}=== 開始安裝 Hysteria 2 ===${PLAIN}"
 echo -e "端口: $HY_PORT 密碼: $HY_PASS"
 
-echo -e "${YELLOW}[1/6] 安裝依賴...${PLAIN}"
-apk update
-apk add --no-cache bash curl wget openssl tar iproute2 file
+echo -e "${YELLOW}[1/6] 分步安裝依賴（減少記憶體峰值佔用）...${PLAIN}"
+apk update -q
+
+# 挨個輕量化安裝，防止併發記憶體暴漲
+for pkg in bash curl wget openssl tar iproute2 file; do
+  echo -e " 正在安裝 $pkg..."
+  apk add --no-cache -q $pkg || echo -e "${YELLOW}警告: $pkg 安裝遇到非致命異常，嘗試繼續...${PLAIN}"
+done
 
 mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log
 
