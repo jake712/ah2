@@ -19,3 +19,14 @@ mkswap /swapfile
 swapon /swapfile
 free -h
 ```
+
+Could not resolve host: raw.githubusercontent.com (Could not contact DNS servers)
+```
+cat /etc/resolv.conf
+# 如果是空的或 127.0.0.11 這種
+
+echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+
+ping -c1 1.1.1.1
+ping -c1 raw.githubusercontent.com
+```
