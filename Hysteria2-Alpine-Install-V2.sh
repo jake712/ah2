@@ -102,14 +102,44 @@ echo -e "密码: ${GREEN}$HY_PASS${PLAIN}"
 
 echo -e "${YELLOW}[1/6] 安装依赖...${PLAIN}"
 apk update
-apk add --no-cache bash curl openssl tar iproute2 jq
+apk add --no-cache bash curl wget openssl tar iproute2 jq
 
 echo -e "${YELLOW}[2/6] 下载 Hysteria 2...${PLAIN}"
 ARCH_TYPE=$(get_arch)
 HY_BIN_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH_TYPE}"
-mkdir -p /usr/local/bin
+mkdir -p /usr/local/bin /tmp
+rm -f /usr/local/bin/hysteria /tmp/hysteria
 echo "下载: $HY_BIN_URL"
-curl -fsSL "$HY_BIN_URL" -o /usr/local/bin/hysteria
+
+# 先检查磁盘空间
+echo "磁盘: $(df -h /usr/local/bin | tail -1)"
+
+# 修复 curl 23 写入错误：先下载到 /tmp，再移动，带重试和备用工具
+download_ok=0
+if command -v curl >/dev/null 2>&1; then
+  echo "尝试 curl 下载..."
+  if curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -o /tmp/hysteria "$HY_BIN_URL"; then
+    download_ok=1
+  else
+    echo -e "${YELLOW}curl 失败，错误码 $?，尝试 wget...${PLAIN}"
+  fi
+fi
+
+if [ $download_ok -eq 0 ] && command -v wget >/dev/null 2>&1; then
+  if wget -O /tmp/hysteria "$HY_BIN_URL"; then
+    download_ok=1
+  fi
+fi
+
+if [ $download_ok -eq 0 ]; then
+  echo -e "${RED}下载失败，可能原因：磁盘满、GitHub 被墙、内存不足${PLAIN}"
+  echo "请手动执行："
+  echo "  df -h"
+  echo "  curl -v -L $HY_BIN_URL -o /tmp/hysteria"
+  exit 1
+fi
+
+mv /tmp/hysteria /usr/local/bin/hysteria
 chmod +x /usr/local/bin/hysteria
 /usr/local/bin/hysteria version || { echo -e "${RED}Hysteria 二进制文件下载失败${PLAIN}"; exit 1; }
 
