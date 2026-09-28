@@ -1,6 +1,7 @@
 #!/bin/bash
-# Hysteria 2 一键安装脚本 for Alpine Linux V2.1 - 修复入口IP版
-# 用法: ./hysteria2-alpine-install-v2.1.sh -p 56764 -w "你的密码" -i "你的入口IP"
+# Hysteria 2 一键安装脚本 for Alpine Linux V3 - 完全修复版
+# 用法: ./hysteria2-alpine-install-v3.sh -p 56764 -w "你的密码" -i "你的入口IP"
+# 或者: curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-Install-V3.sh | bash -s -- -p 56764 -w '你的密码' -i 52.196.190.145
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 DEFAULT_PORT=56764
@@ -10,7 +11,13 @@ while getopts "p:w:i:h" opt; do
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) echo "用法: $0 [-p 端口] [-w 密码] [-i 入口IP]"; echo "  -p 端口  默认 $DEFAULT_PORT"; echo "  -w 密码  默认随机"; echo "  -i IP    手动指定对外展示的服务器IP (入口IP)"; exit 0 ;;
+    h) 
+      echo "用法: $0 [-p 端口] [-w 密码] [-i 入口IP]"
+      echo "  -p 端口  默认 $DEFAULT_PORT"
+      echo "  -w 密码  默认随机生成"
+      echo "  -i IP    手动指定对外展示的服务器IP (入口IP)，解决WARP/多IP问题"
+      exit 0 
+      ;;
   esac
 done
 
@@ -31,11 +38,26 @@ get_arch() {
 }
 gen_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; echo; }
 
-# 端口密码处理
-if [ -z "$CUSTOM_PORT" ]; then read -p "请输入端口 [默认 $DEFAULT_PORT]: " input_port; HY_PORT=${input_port:-$DEFAULT_PORT}; else HY_PORT=$CUSTOM_PORT; fi
-if [ -z "$CUSTOM_PASSWORD" ]; then read -p "请输入密码 [回车随机生成]: " input_pass; if [ -z "$input_pass" ]; then HY_PASS=$(gen_password); echo -e "${YELLOW}随机密码: $HY_PASS${PLAIN}"; else HY_PASS=$input_pass; fi; else HY_PASS=$CUSTOM_PASSWORD; fi
+if [ -z "$CUSTOM_PORT" ]; then 
+  read -p "请输入端口 [默认 $DEFAULT_PORT]: " input_port
+  HY_PORT=${input_port:-$DEFAULT_PORT}
+else 
+  HY_PORT=$CUSTOM_PORT
+fi
 
-echo -e "${GREEN}=== 开始安装 Hysteria 2 ===${PLAIN}"
+if [ -z "$CUSTOM_PASSWORD" ]; then 
+  read -p "请输入密码 [回车随机生成]: " input_pass
+  if [ -z "$input_pass" ]; then 
+    HY_PASS=$(gen_password)
+    echo -e "${YELLOW}随机密码: $HY_PASS${PLAIN}"
+  else 
+    HY_PASS=$input_pass
+  fi
+else 
+  HY_PASS=$CUSTOM_PASSWORD
+fi
+
+echo -e "${GREEN}=== 开始安装 Hysteria 2 V3 ===${PLAIN}"
 echo -e "端口: $HY_PORT 密码: $HY_PASS 入口IP参数: ${CUSTOM_IP:-自动检测}"
 
 echo -e "${YELLOW}[1/6] 安装依赖...${PLAIN}"
@@ -44,13 +66,15 @@ apk add --no-cache bash curl wget openssl tar iproute2 file
 
 mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log
 
-# 2. 下载
 echo -e "${YELLOW}[2/6] 下载 Hysteria 2 (自动重试多镜像)...${PLAIN}"
-ARCH_TYPE=$(get_arch); BIN_NAME="hysteria-linux-${ARCH_TYPE}"; DEST="/usr/local/bin/hysteria"
+ARCH_TYPE=$(get_arch)
+BIN_NAME="hysteria-linux-${ARCH_TYPE}"
+DEST="/usr/local/bin/hysteria"
 URLS=(
 "https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
 "https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
 "https://ghproxy.com/https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
+"https://mirror.ghproxy.com/https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
 )
 download_success=0
 for URL in "${URLS[@]}"; do
@@ -59,8 +83,13 @@ for URL in "${URLS[@]}"; do
   if curl -fL --connect-timeout 10 --max-time 60 -o /tmp/hy.download "$URL" 2>&1; then
     if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML，跳过"; continue; fi
     if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 不是ELF"; continue; fi
-    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 太小 $SIZE"; continue; fi
-    mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功 ($SIZE bytes)${PLAIN}"; break
+    SIZE=$(wc -c < /tmp/hy.download)
+    if [ "$SIZE" -lt 2000000 ]; then echo " -> 太小 $SIZE"; continue; fi
+    mv /tmp/hy.download "$DEST"
+    chmod +x "$DEST"
+    download_success=1
+    echo -e "${GREEN} -> 成功 ($SIZE bytes)${PLAIN}"
+    break
   else
     echo -e "${RED} -> 失败，试下一个${PLAIN}"
   fi
@@ -68,15 +97,14 @@ done
 if [ "$download_success" -ne 1 ]; then echo -e "${RED}所有镜像失败${PLAIN}"; exit 1; fi
 "$DEST" version
 
-# 3. 证书
 echo -e "${YELLOW}[3/6] 生成 TLS 证书...${PLAIN}"
 openssl ecparam -genkey -name prime256v1 -noout -out /etc/ssl/private/bing.key
 openssl req -new -x509 -nodes -key /etc/ssl/private/bing.key -out /etc/ssl/private/bing.crt -days 3650 -subj "/CN=bing.com"
-chmod 600 /etc/ssl/private/bing.key; chmod 644 /etc/ssl/private/bing.crt
+chmod 600 /etc/ssl/private/bing.key
+chmod 644 /etc/ssl/private/bing.crt
 
-# 4. 配置
 echo -e "${YELLOW}[4/6] 生成配置文件...${PLAIN}"
-cat > /etc/hysteria/config.yaml <<EOF
+cat > /etc/hysteria/config.yaml <<CONFIGEOF
 listen: :${HY_PORT}
 
 tls:
@@ -98,10 +126,10 @@ quic:
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
-EOF
+CONFIGEOF
 
-# 5. 服务
-cat > /etc/init.d/hysteria <<'SERVICE_EOF'
+echo -e "${YELLOW}[5/6] 创建服务...${PLAIN}"
+cat > /etc/init.d/hysteria <<'SERVICEEOF'
 #!/sbin/openrc-run
 name="Hysteria 2 Service"
 description="Hysteria 2 Proxy Server"
@@ -119,11 +147,10 @@ start_pre() {
   checkpath --directory --mode 0755 /run
   checkpath --file --mode 0644 /var/log/hysteria.log
 }
-SERVICE_EOF
+SERVICEEOF
 chmod +x /etc/init.d/hysteria
 rc-update add hysteria default
 
-# 6. 启动
 echo -e "${YELLOW}[6/6] 启动服务...${PLAIN}"
 rc-service hysteria restart || rc-service hysteria start
 sleep 2
@@ -150,10 +177,10 @@ else
   LOCAL_IP=$(get_default_ip)
   echo -e "检测到 出口公网IP: ${YELLOW}${PUBLIC_IP:-未知}${PLAIN}"
   echo -e "检测到 本机默认路由IP: ${YELLOW}${LOCAL_IP:-未知}${PLAIN}"
-  # 优先用公网IP，如果拿不到就用本地IP
   if [ -n "$PUBLIC_IP" ]; then SERVER_IP="$PUBLIC_IP"; else SERVER_IP="$LOCAL_IP"; fi
   if [ -z "$SERVER_IP" ]; then SERVER_IP="YOUR_SERVER_IP"; fi
-  echo -e "${YELLOW}如果 出口IP != 入口IP，请下次用 -i 参数手动指定: curl ... | bash -s -- -p $HY_PORT -w '$HY_PASS' -i 你的入口IP${PLAIN}"
+  echo -e "${YELLOW}如果 出口IP != 入口IP，请下次用 -i 参数手动指定${PLAIN}"
+  echo -e "${YELLOW}示例: curl ... | bash -s -- -p $HY_PORT -w '$HY_PASS' -i 你的入口IP${PLAIN}"
 fi
 
 echo ""
@@ -170,7 +197,7 @@ echo "  sni: bing.com"
 echo "  insecure: true"
 echo ""
 echo -e "URI:"
-echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2-${SERVER_IP}${PLAIN}"
 echo ""
 echo -e "${YELLOW}记得放行防火墙 UDP ${HY_PORT}${PLAIN}"
-echo -e "${YELLOW}如果服务器有多个IP或用了WARP，请确认 ${SERVER_IP} 是你SSH连接的那个IP，不是WARP的IP${PLAIN}"
+echo -e "${YELLOW}如果服务器有多个IP或用了WARP，请确认 ${SERVER_IP} 是你SSH连接的那个IP${PLAIN}"
