@@ -9,3 +9,13 @@ curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-I
 youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
 
 donate: https://jake712.com/?p=120
+
+65M小雞要安裝临时建一个 Swap
+
+```
+fallocate -l 512M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=512
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+free -h
+```
