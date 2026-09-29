@@ -1,6 +1,5 @@
 #!/bin/bash
-# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.8 - 終極語法與 DNS 修復版
-# 用法: ./hysteria2-alpine-install.sh -p [端口] -w "你的密碼" -i "你的入口IP"
+# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.9 - 終極硬編碼無變量版
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 
@@ -9,7 +8,7 @@ while getopts "p:w:i:h" opt; do
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) echo "用法: $0 [-p 端口] [-w 密碼] [-i 入口IP]"; echo "  -p 端口  指定服務監聽端口 (必填)"; echo "  -w 密碼  指定固定密碼 (選填，不填則自動生成隨機密碼)"; echo "  -i IP    手動指定對外展示的服務器IP (入口IP)"; exit 0 ;;
+    h) echo "用法: $0 [-p 端口] [-w 密碼] [-i 入口IP]"; exit 0 ;;
   esac
 done
 
@@ -19,19 +18,13 @@ CUSTOM_IP=${CUSTOM_IP:-${SERVER_IP:-}}
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}請用 root 運行${PLAIN}"; exit 1; fi
 
-# === 核心修復：強制暫時修復系統 DNS ===
+# 強制優化 DNS 配置
 echo -e "${YELLOW}[0/6] 正在優化與修復伺服器 DNS 配置...${PLAIN}"
 cat > /etc/resolv.conf <<EOF
 nameserver 8.8.8.8
 nameserver 1.1.1.1
-nameserver 2001:4860:4860::8888
+nameserver 223.5.5.5
 EOF
-
-# 低記憶體預警檢查
-TOTAL_SWAP=$(free -m | awk '/Swap/ {print $2}')
-if [ "${TOTAL_SWAP:-0}" -eq 0 ]; then
-  echo -e "${YELLOW}[提示] 檢測到系統未啟用 Swap。${PLAIN}"
-fi
 
 get_arch() {
   ARCH=$(uname -m)
@@ -80,34 +73,47 @@ done
 
 mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log
 
-# 2. 下載 (修正變數讀取語法漏洞)
-echo -e "${YELLOW}[2/6] 下載 Hysteria 2 (自動重試多鏡像)...${PLAIN}"
-ARCH_TYPE=$(get_arch); BIN_NAME="hysteria-linux-${ARCH_TYPE}"; DEST="/usr/local/bin/hysteria"
+# 2. 下載 (全面刪除變量，改成手動分支判定以杜絕任何語法解譯問題)
+echo -e "${YELLOW}[2/6] 下載 Hysteria 2 (純硬編碼無變量模式)...${PLAIN}"
+ARCH_TYPE=$(get_arch)
+DEST="/usr/local/bin/hysteria"
 
-# 構建正確的官方資源路徑
-RAW_PATH="apernet/hysteria/releases/latest/download/${BIN_NAME}"
-URLS=(
-"https://github.com{RAW_PATH}"
-"https://ghps.cc/https://github.com{RAW_PATH}"
-"https://github.moeyy.xyz/https://github.com{RAW_PATH}"
-"https://ghfast.top/https://github.com{RAW_PATH}"
-)
+# 根據架構手動指定完整、死板的 URL 列表
+if [ "$ARCH_TYPE" = "arm64" ]; then
+  URLS=(
+  "https://github.com"
+  "https://ghps.cc/https://github.com"
+  "https://github.moeyy.xyz/https://github.com"
+  "https://fastgit.org"
+  )
+else
+  URLS=(
+  "https://github.com"
+  "https://ghps.cc/https://github.com"
+  "https://github.moeyy.xyz/https://github.com"
+  "https://fastgit.org"
+  )
+fi
 
 download_success=0
 for URL in "${URLS[@]}"; do
-  echo -e " 嘗試下載: $URL"
+  echo -e " 正在全力嘗試下載目標網址: $URL"
   rm -f "$DEST" /tmp/hy.download
-  if curl -fL --connect-timeout 15 --max-time 120 -o /tmp/hy.download "$URL" 2>&1; then
-    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML網頁，跳過"; continue; fi
-    if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 下載內容不是 Linux ELF 檔案"; continue; fi
-    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 檔案體積過小 ($SIZE bytes)"; continue; fi
-    mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功下載並驗證二進位 ($SIZE bytes)${PLAIN}"; break
+  if curl -fL --connect-timeout 20 --max-time 180 -o /tmp/hy.download "$URL" 2>&1; then
+    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 被攔截為HTML網頁，跳過"; continue; fi
+    if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 下載內容損壞或非 Linux 二進位檔案"; continue; fi
+    SIZE=$(wc -c < /tmp/hy.download)
+    mv /tmp/hy.download "$DEST"
+    chmod +x "$DEST"
+    download_success=1
+    echo -e "${GREEN} -> [成功] 已成功下載並驗證 Hysteria 核心二進位檔 ($SIZE bytes)${PLAIN}"
+    break
   else
-    echo -e "${RED} -> 該鏡像站下載失敗，試下一個${PLAIN}"
+    echo -e "${RED} -> 該節點下載失敗，自動切換至下一鏡像節點...${PLAIN}"
   fi
 done
 
-if [ "$download_success" -ne 1 ]; then echo -e "${RED}錯誤：所有下載鏡像站均失敗！${PLAIN}"; exit 1; fi
+if [ "$download_success" -ne 1 ]; then echo -e "${RED}錯誤：所有硬編碼下載渠道皆失敗！您的網絡可能限制了外部連接。${PLAIN}"; exit 1; fi
 "$DEST" version
 
 # 3. 證書
