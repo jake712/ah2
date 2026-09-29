@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.7 - 網路與下載修復優化版
+# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.8 - 終極語法與 DNS 修復版
 # 用法: ./hysteria2-alpine-install.sh -p [端口] -w "你的密碼" -i "你的入口IP"
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
@@ -19,10 +19,18 @@ CUSTOM_IP=${CUSTOM_IP:-${SERVER_IP:-}}
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}請用 root 運行${PLAIN}"; exit 1; fi
 
+# === 核心修復：強制暫時修復系統 DNS ===
+echo -e "${YELLOW}[0/6] 正在優化與修復伺服器 DNS 配置...${PLAIN}"
+cat > /etc/resolv.conf <<EOF
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+nameserver 2001:4860:4860::8888
+EOF
+
 # 低記憶體預警檢查
 TOTAL_SWAP=$(free -m | awk '/Swap/ {print $2}')
 if [ "${TOTAL_SWAP:-0}" -eq 0 ]; then
-  echo -e "${YELLOW}[提示] 檢測到系統未啟用 Swap 虛擬記憶體。如果是極低記憶體(如128MB/256MB)環境，接下來可能還會被系統 Killed。${PLAIN}"
+  echo -e "${YELLOW}[提示] 檢測到系統未啟用 Swap。${PLAIN}"
 fi
 
 get_arch() {
@@ -36,7 +44,7 @@ get_arch() {
 }
 gen_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; }
 
-# 端口處理：強制要求輸入
+# 端口處理
 if [ -z "$CUSTOM_PORT" ]; then
   while true; do
     read -p "請輸入 Hysteria 2 端口 (1-65535): " input_port
@@ -51,7 +59,7 @@ else
   HY_PORT=$CUSTOM_PORT
 fi
 
-# 密碼處理：全自動生成
+# 密碼處理
 if [ -z "$CUSTOM_PASSWORD" ]; then
   HY_PASS=$(gen_password)
   echo -e "${YELLOW}未指定密碼，已自動生成隨機密碼: $HY_PASS${PLAIN}"
@@ -63,16 +71,16 @@ echo -e "${GREEN}=== 開始安裝 Hysteria 2 ===${PLAIN}"
 echo -e "端口: $HY_PORT 密碼: $HY_PASS"
 
 echo -e "${YELLOW}[1/6] 分步安裝依賴...${PLAIN}"
-apk update -q
+apk update
 
 for pkg in bash curl wget openssl tar iproute2 file; do
   echo -e " 正在安裝 $pkg..."
-  apk add --no-cache -q $pkg || echo -e "${YELLOW}警告: $pkg 安裝遇到非致命異常，嘗試繼續...${PLAIN}"
+  apk add --no-cache $pkg || echo -e "${YELLOW}警告: $pkg 安裝遇到異常，嘗試繼續...${PLAIN}"
 done
 
 mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log
 
-# 2. 下載 (已徹底修正路徑漏洞，更換最新可用 Proxy)
+# 2. 下載 (修正變數讀取語法漏洞)
 echo -e "${YELLOW}[2/6] 下載 Hysteria 2 (自動重試多鏡像)...${PLAIN}"
 ARCH_TYPE=$(get_arch); BIN_NAME="hysteria-linux-${ARCH_TYPE}"; DEST="/usr/local/bin/hysteria"
 
@@ -90,16 +98,16 @@ for URL in "${URLS[@]}"; do
   echo -e " 嘗試下載: $URL"
   rm -f "$DEST" /tmp/hy.download
   if curl -fL --connect-timeout 15 --max-time 120 -o /tmp/hy.download "$URL" 2>&1; then
-    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML網頁網頁，非二進位，跳過"; continue; fi
+    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML網頁，跳過"; continue; fi
     if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 下載內容不是 Linux ELF 檔案"; continue; fi
-    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 檔案體積過小 ($SIZE bytes)，下載可能不完整"; continue; fi
+    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 檔案體積過小 ($SIZE bytes)"; continue; fi
     mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功下載並驗證二進位 ($SIZE bytes)${PLAIN}"; break
   else
     echo -e "${RED} -> 該鏡像站下載失敗，試下一個${PLAIN}"
   fi
 done
 
-if [ "$download_success" -ne 1 ]; then echo -e "${RED}錯誤：所有下載鏡像站均失敗！請確認伺服器 DNS 或網絡是否正常。${PLAIN}"; exit 1; fi
+if [ "$download_success" -ne 1 ]; then echo -e "${RED}錯誤：所有下載鏡像站均失敗！${PLAIN}"; exit 1; fi
 "$DEST" version
 
 # 3. 證書
@@ -182,7 +190,6 @@ get_default_ip() {
   ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1
 }
 
-# 獲取當前 SSH 階段的伺服器端 IP
 get_ssh_server_ip() {
   if [ -n "$SSH_CONNECTION" ]; then
     echo "$SSH_CONNECTION" | awk '{print $3}'
