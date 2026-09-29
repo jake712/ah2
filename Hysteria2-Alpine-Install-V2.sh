@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hysteria 2 一鍵安裝 for Alpine Linux V3.2 - POSIX兼容+入口IP修復版
+# Hysteria 2 Alpine V3.3 - 自動跟隨SSH入口IP最終版
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 
@@ -12,35 +12,41 @@ while getopts "p:w:i:h" opt; do
   esac
 done
 
-CUSTOM_PORT=${CUSTOM_PORT:-${PORT:-}}
-CUSTOM_PASSWORD=${CUSTOM_PASSWORD:-${PASSWORD:-}}
-CUSTOM_IP=${CUSTOM_IP:-${SERVER_IP:-}}
-
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}請用 root 運行${PLAIN}"; exit 1; fi
 
-echo -e "${YELLOW}[0/6] 正在優化 DNS...${PLAIN}"
+# DNS
+echo -e "${YELLOW}[0/6] 優化DNS...${PLAIN}"
 cat > /etc/resolv.conf <<EOF
 nameserver 8.8.8.8
 nameserver 1.1.1.1
 nameserver 223.5.5.5
 EOF
 
-get_arch() { case $(uname -m) in x86_64|amd64) echo "amd64";; aarch64|arm64) echo "arm64";; *) echo "amd64";; esac; }
-gen_password() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; }
+get_arch() {
+  case $(uname -m) in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "amd64" ;;
+  esac
+}
+gen_pass() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16; }
 
-# === 修復點1：端口判斷不用 [[ =~ ]] ===
+# 端口
 if [ -z "$CUSTOM_PORT" ]; then
   while true; do
-    printf "請輸入 Hysteria 2 端口 (1-65535): "
-    read input_port
-    case "$input_port" in
+    printf "請輸入端口 (1-65535): "
+    read INP
+    case "$INP" in
       ''|*[!0-9]*)
-        echo -e "${RED}請輸入正確的數字！${PLAIN}"; continue ;;
+        echo -e "${RED}只能輸入數字${PLAIN}"
+        continue
+        ;;
       *)
-        if [ "$input_port" -ge 1 ] 2>/dev/null && [ "$input_port" -le 65535 ] 2>/dev/null; then
-          HY_PORT=$input_port; break
+        if [ "$INP" -ge 1 ] && [ "$INP" -le 65535 ]; then
+          HY_PORT=$INP
+          break
         else
-          echo -e "${RED}端口範圍 1-65535！${PLAIN}"
+          echo -e "${RED}範圍 1-65535${PLAIN}"
         fi
         ;;
     esac
@@ -49,39 +55,52 @@ else
   HY_PORT=$CUSTOM_PORT
 fi
 
-if [ -z "$CUSTOM_PASSWORD" ]; then HY_PASS=$(gen_password); echo -e "${YELLOW}已自動生成: $HY_PASS${PLAIN}"; else HY_PASS=$CUSTOM_PASSWORD; fi
+if [ -z "$CUSTOM_PASSWORD" ]; then
+  HY_PASS=$(gen_pass)
+  echo -e "${YELLOW}自動生成密碼: $HY_PASS${PLAIN}"
+else
+  HY_PASS=$CUSTOM_PASSWORD
+fi
 
-echo -e "${GREEN}=== 開始安裝 Hysteria 2 ===${PLAIN}"
-echo -e "${YELLOW}[1/6] 安裝依賴...${PLAIN}"
+echo -e "${GREEN}=== 開始安裝 ===${PLAIN}"
+
+# 依賴
 apk update
-for pkg in bash curl wget openssl tar iproute2 file procps; do apk add --no-cache $pkg || true; done
+for p in curl wget openssl tar iproute2 file procps openssh; do
+  apk add --no-cache $p || true
+done
 mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log /run/hysteria
 
-echo -e "${YELLOW}[2/6] 下載 Hysteria 2...${PLAIN}"
-ARCH_TYPE=$(get_arch); DEST="/usr/local/bin/hysteria"
-if [ "$ARCH_TYPE" = "arm64" ]; then BIN_NAME="hysteria-linux-arm64"; else BIN_NAME="hysteria-linux-amd64"; fi
-BASE="https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
-URLS="${BASE} https://ghps.cc/${BASE} https://ghproxy.net/${BASE} https://ghfast.top/${BASE} https://github.moeyy.xyz/${BASE}"
+# 下載
+ARCH=$(get_arch)
+if [ "$ARCH" = "arm64" ]; then BIN="hysteria-linux-arm64"; else BIN="hysteria-linux-amd64"; fi
+BASE="https://github.com/apernet/hysteria/releases/latest/download/${BIN}"
+DEST="/usr/local/bin/hysteria"
+URLS="$BASE https://ghps.cc/$BASE https://ghproxy.net/$BASE https://ghfast.top/$BASE https://github.moeyy.xyz/$BASE"
 
-download_success=0
-for URL in $URLS; do
-  echo -e " 嘗試: $URL"; rm -f /tmp/hy.download
-  if curl -fL --connect-timeout 10 --max-time 120 -o /tmp/hy.download "$URL" 2>&1; then
-    if head -c 200 /tmp/hy.download | grep -qi "<html"; then echo "  -> HTML跳過"; continue; fi
-    if ! head -c 4 /tmp/hy.download | grep -q "$(printf '\x7fELF')"; then echo "  -> 非ELF跳過"; continue; fi
-    mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功${PLAIN}"; break
+ok=0
+for U in $URLS; do
+  echo " 嘗試 $U"
+  rm -f /tmp/hy.down
+  if curl -fL --connect-timeout 10 --max-time 120 -o /tmp/hy.down "$U" 2>&1; then
+    if head -c 200 /tmp/hy.down | grep -qi "<html"; then echo "  -> HTML跳過"; continue; fi
+    SIZE=$(wc -c < /tmp/hy.down)
+    if [ "$SIZE" -lt 4000000 ]; then echo "  -> 文件過小跳過"; continue; fi
+    mv /tmp/hy.down $DEST
+    chmod +x $DEST
+    ok=1
+    break
   fi
 done
-if [ "$download_success" -ne 1 ]; then echo -e "${RED}下載失敗${PLAIN}"; exit 1; fi
-"$DEST" version
+if [ "$ok" -ne 1 ]; then echo -e "${RED}下載失敗${PLAIN}"; exit 1; fi
+$DEST version
 
-echo -e "${YELLOW}[3/6] 生成證書...${PLAIN}"
+# 證書
 openssl ecparam -genkey -name prime256v1 -noout -out /etc/ssl/private/bing.key
 openssl req -new -x509 -nodes -key /etc/ssl/private/bing.key -out /etc/ssl/private/bing.crt -days 3650 -subj "/CN=bing.com"
-chmod 600 /etc/ssl/private/bing.key; chmod 644 /etc/ssl/private/bing.crt
 
-echo -e "${YELLOW}[4/6] 生成配置...${PLAIN}"
-cat > /etc/hysteria/config.yaml <<EOF
+# 配置
+cat > /etc/hysteria/config.yaml <<EOC
 listen: :${HY_PORT}
 tls:
   cert: /etc/ssl/private/bing.crt
@@ -94,16 +113,11 @@ masquerade:
   proxy:
     url: https://bing.com
     rewriteHost: true
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-EOF
+EOC
 
-cat > /etc/init.d/hysteria <<'SERVICE_EOF'
+cat > /etc/init.d/hysteria <<'EOS'
 #!/sbin/openrc-run
-name="Hysteria 2 Service"
+name="hysteria"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml"
 command_background="yes"
@@ -111,56 +125,59 @@ pidfile="/run/hysteria/${RC_SVCNAME}.pid"
 output_log="/var/log/hysteria.log"
 error_log="/var/log/hysteria.log"
 depend() { need net; after firewall; }
-start_pre() { checkpath --directory --mode 0755 /run/hysteria; checkpath --file --mode 0644 /var/log/hysteria.log; }
-SERVICE_EOF
-chmod +x /etc/init.d/hysteria; rc-update add hysteria default
+start_pre() { checkpath --directory --mode 0755 /run/hysteria; }
+EOS
+chmod +x /etc/init.d/hysteria
+rc-update add hysteria default
+rc-service hysteria restart || rc-service hysteria start
+sleep 2
 
-echo -e "${YELLOW}[5/6] 啟動服務...${PLAIN}"
-rc-service hysteria restart || rc-service hysteria start; sleep 2
-
-# === 修復點2：V3.2 智慧IP檢測，完全不用 [[ ]] ===
-get_public_ip() {
-  for api in "https://ifconfig.me" "https://ipinfo.io/ip" "https://icanhazip.com"; do
-    ip=$(curl -4 -s --max-time 5 "$api" 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
-    if [ -n "$ip" ]; then echo "$ip"; return; fi
-  done; echo ""
-}
-get_default_ip() { ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1; }
-get_ssh_server_ip() {
-  ip=""; 
+# ===== V3.3 核心：自動跟隨SSH IP =====
+get_ssh_ip() {
+  # 方法1: 當前環境
   if [ -n "$SSH_CONNECTION" ]; then
-    ip=$(echo "$SSH_CONNECTION" | awk '{print $3}')
-    echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-    if [ $? -eq 0 ] && [ "$ip" != "127.0.0.1" ]; then echo "$ip"; return; fi
+    echo "$SSH_CONNECTION" | awk '{print $3}' | grep -E '^[0-9.]+$' | grep -v '^127\.'
+    return
   fi
+  # 方法2: 從 /proc 找回被sudo弄丟的
   if [ -d /proc ]; then
-    for pid in $(ps -o pid= 2>/dev/null); do
-      if [ -f "/proc/$pid/environ" ]; then
-        ip=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep '^SSH_CONNECTION=' | cut -d= -f2 | awk '{print $3}' | tail -n1)
-        echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-        if [ $? -eq 0 ] && [ "$ip" != "127.0.0.1" ] && [ -n "$ip" ]; then echo "$ip"; return; fi
+    for f in /proc/[0-9]*/environ; do
+      [ -f "$f" ] || continue
+      ip=$(tr '\0' '\n' < "$f" 2>/dev/null | grep '^SSH_CONNECTION=' | cut -d= -f2 | awk '{print $3}')
+      if echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        if [ "$ip" != "127.0.0.1" ] && [ -n "$ip" ]; then
+          echo "$ip"
+          return
+        fi
       fi
     done
   fi
-  ip=$(ss -Htn state established '( dport = :22 or sport = :22 )' 2>/dev/null | awk '{print $4}' | cut -d: -f1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | head -n1)
-  if [ -n "$ip" ]; then echo "$ip"; return; fi
-  echo ""
+  # 方法3: ss 連線反推
+  ss -Htn 2>/dev/null | grep ':22' | awk '{print $4}' | cut -d: -f1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | head -n1
 }
 
-echo -e "${YELLOW}[6/6] 檢測 IP...${PLAIN}"
-if [ -n "$CUSTOM_IP" ]; then
-  SERVER_IP="$CUSTOM_IP"
-  echo -e "${GREEN}使用 -i 指定入口IP: $SERVER_IP${PLAIN}"
-else
-  SSH_IP=$(get_ssh_server_ip); PUBLIC_IP=$(get_public_ip); LOCAL_IP=$(get_default_ip)
-  echo -e " SSH入口IP: ${GREEN}${SSH_IP:-未檢測到}${PLAIN}"
-  echo -e " 出口公網IP: ${YELLOW}${PUBLIC_IP:-未知}${PLAIN}"
-  echo -e " 本地路由IP: ${YELLOW}${LOCAL_IP:-未知}${PLAIN}"
-  if [ -n "$SSH_IP" ]; then SERVER_IP="$SSH_IP"; echo -e "${GREEN}>> 已採用入口IP: $SERVER_IP${PLAIN}"
-  elif [ -n "$PUBLIC_IP" ]; then SERVER_IP="$PUBLIC_IP"
-  else SERVER_IP="$LOCAL_IP"; fi
-fi
-[ -z "$SERVER_IP" ] && SERVER_IP="YOUR_SERVER_IP"
+get_pub_ip() {
+  curl -4s --max-time 3 https://ifconfig.me 2>/dev/null | grep -Eo '[0-9.]{7,15}' | head -n1
+}
 
-echo ""; echo -e "${GREEN}========== 安裝完成 ==========${PLAIN}"
-echo -e "URI: ${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2${PLAIN}"
+echo -e "${YELLOW}[6/6] IP檢測...${PLAIN}"
+if [ -n "$CUSTOM_IP" ]; then
+  SERVER_IP=$CUSTOM_IP
+  echo -e "${GREEN}手動指定 -i: $SERVER_IP${PLAIN}"
+else
+  SIP=$(get_ssh_ip)
+  PIP=$(get_pub_ip)
+  echo -e " 檢測到 SSH入口IP: ${GREEN}${SIP:-未找到}${PLAIN}"
+  echo -e " 檢測到 出口公網IP: ${YELLOW}${PIP:-未知}${PLAIN}"
+  if [ -n "$SIP" ]; then
+    SERVER_IP=$SIP
+    echo -e "${GREEN}>> 自動採用 SSH入口IP: $SERVER_IP (可連)${PLAIN}"
+  else
+    SERVER_IP=$PIP
+    echo -e "${YELLOW}>> 未找到SSH IP，採用出口IP: $SERVER_IP${PLAIN}"
+  fi
+fi
+
+echo ""
+echo -e "${GREEN}========== 完成 ==========${PLAIN}"
+echo -e "hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2"
