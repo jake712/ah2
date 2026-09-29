@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.6 - 低記憶體優化版
+# Hysteria 2 一鍵安裝腳本 for Alpine Linux V2.7 - 網路與下載修復優化版
 # 用法: ./hysteria2-alpine-install.sh -p [端口] -w "你的密碼" -i "你的入口IP"
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
@@ -19,7 +19,7 @@ CUSTOM_IP=${CUSTOM_IP:-${SERVER_IP:-}}
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}請用 root 運行${PLAIN}"; exit 1; fi
 
-# 低記憶體預警檢查 (Swap 檢查)
+# 低記憶體預警檢查
 TOTAL_SWAP=$(free -m | awk '/Swap/ {print $2}')
 if [ "${TOTAL_SWAP:-0}" -eq 0 ]; then
   echo -e "${YELLOW}[提示] 檢測到系統未啟用 Swap 虛擬記憶體。如果是極低記憶體(如128MB/256MB)環境，接下來可能還會被系統 Killed。${PLAIN}"
@@ -62,10 +62,9 @@ fi
 echo -e "${GREEN}=== 開始安裝 Hysteria 2 ===${PLAIN}"
 echo -e "端口: $HY_PORT 密碼: $HY_PASS"
 
-echo -e "${YELLOW}[1/6] 分步安裝依賴（減少記憶體峰值佔用）...${PLAIN}"
+echo -e "${YELLOW}[1/6] 分步安裝依賴...${PLAIN}"
 apk update -q
 
-# 挨個輕量化安裝，防止併發記憶體暴漲
 for pkg in bash curl wget openssl tar iproute2 file; do
   echo -e " 正在安裝 $pkg..."
   apk add --no-cache -q $pkg || echo -e "${YELLOW}警告: $pkg 安裝遇到非致命異常，嘗試繼續...${PLAIN}"
@@ -73,28 +72,34 @@ done
 
 mkdir -p /usr/local/bin /etc/ssl/private /etc/hysteria /var/log
 
-# 2. 下載
+# 2. 下載 (已徹底修正路徑漏洞，更換最新可用 Proxy)
 echo -e "${YELLOW}[2/6] 下載 Hysteria 2 (自動重試多鏡像)...${PLAIN}"
 ARCH_TYPE=$(get_arch); BIN_NAME="hysteria-linux-${ARCH_TYPE}"; DEST="/usr/local/bin/hysteria"
+
+# 構建正確的官方資源路徑
+RAW_PATH="apernet/hysteria/releases/latest/download/${BIN_NAME}"
 URLS=(
-"https://github.com{BIN_NAME}"
-"https://ghfast.top/https://github.com{BIN_NAME}"
-"https://ghproxy.com/https://github.com{BIN_NAME}"
+"https://github.com{RAW_PATH}"
+"https://ghps.cc/https://github.com{RAW_PATH}"
+"https://github.moeyy.xyz/https://github.com{RAW_PATH}"
+"https://ghfast.top/https://github.com{RAW_PATH}"
 )
+
 download_success=0
 for URL in "${URLS[@]}"; do
-  echo -e " 嘗試: $URL"
+  echo -e " 嘗試下載: $URL"
   rm -f "$DEST" /tmp/hy.download
-  if curl -fL --connect-timeout 10 --max-time 60 -o /tmp/hy.download "$URL" 2>&1; then
-    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML，跳過"; continue; fi
-    if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 不是ELF"; continue; fi
-    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 太小 $SIZE"; continue; fi
-    mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功 ($SIZE bytes)${PLAIN}"; break
+  if curl -fL --connect-timeout 15 --max-time 120 -o /tmp/hy.download "$URL" 2>&1; then
+    if head -c 20 /tmp/hy.download | grep -qi "<html"; then echo " -> 是HTML網頁網頁，非二進位，跳過"; continue; fi
+    if ! head -c 4 /tmp/hy.download | grep -q $'\x7fELF'; then echo " -> 下載內容不是 Linux ELF 檔案"; continue; fi
+    SIZE=$(wc -c < /tmp/hy.download); if [ "$SIZE" -lt 2000000 ]; then echo " -> 檔案體積過小 ($SIZE bytes)，下載可能不完整"; continue; fi
+    mv /tmp/hy.download "$DEST"; chmod +x "$DEST"; download_success=1; echo -e "${GREEN} -> 成功下載並驗證二進位 ($SIZE bytes)${PLAIN}"; break
   else
-    echo -e "${RED} -> 失敗，試下一個${PLAIN}"
+    echo -e "${RED} -> 該鏡像站下載失敗，試下一個${PLAIN}"
   fi
 done
-if [ "$download_success" -ne 1 ]; then echo -e "${RED}所有鏡像失敗${PLAIN}"; exit 1; fi
+
+if [ "$download_success" -ne 1 ]; then echo -e "${RED}錯誤：所有下載鏡像站均失敗！請確認伺服器 DNS 或網絡是否正常。${PLAIN}"; exit 1; fi
 "$DEST" version
 
 # 3. 證書
