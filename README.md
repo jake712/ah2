@@ -1,4 +1,4 @@
-Alpine/Debian 一鍵安裝Hysteria 2
+Alpine 一鍵安裝Hysteria 2
 
 端口 後台打開的端口
 主機IP SSH的IP
