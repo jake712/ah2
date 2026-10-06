@@ -79,6 +79,13 @@ ps aux | grep hysteria | grep -v grep || true
 # 修复 grep -p 被当成参数的问题，加 --
 ss -unlp 2>/dev/null | grep -- "$HY_PORT" || ss -tulpn 2>/dev/null | grep -- "$HY_PORT" || cat /var/log/hysteria.log | tail -n 30
 
+# IPv6 链接必须加 []，否则客户端解析失败
+if [[ "$SERVER_IP" == *:* ]] && [[ "$SERVER_IP" != "["*"]" ]]; then
+  SERVER_IP_URL="[${SERVER_IP}]"
+else
+  SERVER_IP_URL="${SERVER_IP}"
+fi
+
 echo ""
 echo -e "${GREEN}========== 完成 ==========${PLAIN}"
 echo -e "端口: ${CYAN}${HY_PORT}${PLAIN}"
@@ -86,5 +93,8 @@ echo -e "密码: ${CYAN}${HY_PASS}${PLAIN}"
 echo -e "IP/域名: ${CYAN}${SERVER_IP}${PLAIN}"
 echo ""
 echo -e "${GREEN}分享链接:${PLAIN}"
-echo -e "hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Podman-${HY_PORT}"
+echo -e "hysteria2://${HY_PASS}@${SERVER_IP_URL}:${HY_PORT}/?sni=bing.com&insecure=1#Podman-${HY_PORT}"
+echo ""
+echo -e "${GREEN}IPv6专用 (带括号):${PLAIN}"
+echo -e "hysteria2://${HY_PASS}@${SERVER_IP_URL}:${HY_PORT}/?sni=bing.com&insecure=1"
 echo ""
