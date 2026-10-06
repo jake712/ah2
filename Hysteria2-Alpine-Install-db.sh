@@ -1,30 +1,37 @@
 #!/bin/bash
-# Hysteria2 Podman专用版 - 保证输出分享链接
+# Hysteria2 Podman专用版 V2 - 支持 -p -w -i 参数，修复 grep -p 报错
 set -e
 YELLOW='\033[0;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
 
-# 取消默认26169，随机端口
-if [ -z "$1" ]; then
+while getopts "p:w:i:h" opt; do
+  case $opt in
+    p) CUSTOM_PORT=$OPTARG ;;
+    w) CUSTOM_PASSWORD=$OPTARG ;;
+    i) CUSTOM_IP=$OPTARG ;;
+    h) echo "用法: $0 [-p 端口] [-w 密码] [-i IP/域名]"; exit 0 ;;
+  esac
+done
+
+if [ -z "$CUSTOM_PORT" ]; then
   if command -v shuf >/dev/null 2>&1; then
     HY_PORT=$(shuf -i 20000-60000 -n 1)
   else
     HY_PORT=$((RANDOM % 40000 + 20000))
   fi
+  echo -e "${YELLOW}未指定 -p，已随机端口: ${CYAN}${HY_PORT}${PLAIN}"
 else
-  HY_PORT=$1
+  HY_PORT=$CUSTOM_PORT
 fi
 
-# 第二个参数是密码
-if [ -n "$2" ]; then
-  HY_PASS=$2
+if [ -n "$CUSTOM_PASSWORD" ]; then
+  HY_PASS=$CUSTOM_PASSWORD
 else
   HY_PASS=$(openssl rand -base64 12 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 16)
   [ -z "$HY_PASS" ] && HY_PASS="Hy2$(date +%s | tail -c 6)"
 fi
 
-# 第三个参数是IP
-if [ -n "$3" ]; then
-  SERVER_IP=$3
+if [ -n "$CUSTOM_IP" ]; then
+  SERVER_IP=$CUSTOM_IP
 else
   SERVER_IP=$(curl -4fsSL --max-time 4 https://api4.ipify.org 2>/dev/null || curl -4fsSL --max-time 4 https://ifconfig.me/ip 2>/dev/null || echo "YOUR_IP")
 fi
@@ -37,12 +44,14 @@ if [ ! -s /tmp/hysteria ]; then curl -4fsSL -o /tmp/hysteria "https://ghfast.top
 mkdir -p /etc/hysteria /usr/local/bin
 mv /tmp/hysteria /usr/local/bin/hysteria 2>/dev/null || true
 chmod +x /usr/local/bin/hysteria
+/usr/local/bin/hysteria version 2>&1 | head -n 5 || true
 
 echo -e "${YELLOW}[2/3] 生成配置...${PLAIN}"
 mkdir -p /etc/hysteria
-if [ ! -f /etc/hysteria/cert.crt ]; then
+if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || openssl genrsa -out /etc/hysteria/key.key 2048 2>/dev/null
   openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650 2>/dev/null
+  chmod 600 /etc/hysteria/key.key 2>/dev/null || true
 fi
 
 cat > /etc/hysteria/config.yaml <<EOF
@@ -61,21 +70,21 @@ tls:
 EOF
 cat /etc/hysteria/config.yaml
 
-echo -e "${YELLOW}[3/3] 启动 (nohup, 不碰systemd)...${PLAIN}"
+echo -e "${YELLOW}[3/3] 启动 (nohup)...${PLAIN}"
 pkill -9 hysteria 2>/dev/null || true
 sleep 1
 nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 sleep 2
 ps aux | grep hysteria | grep -v grep || true
-ss -unlp 2>/dev/null | grep -E "$HY_PORT|hysteria" || netstat -unlp 2>/dev/null | grep "$HY_PORT" || cat /var/log/hysteria.log | tail -n 20
+# 修复 grep -p 被当成参数的问题，加 --
+ss -unlp 2>/dev/null | grep -- "$HY_PORT" || ss -tulpn 2>/dev/null | grep -- "$HY_PORT" || cat /var/log/hysteria.log | tail -n 30
 
 echo ""
 echo -e "${GREEN}========== 完成 ==========${PLAIN}"
 echo -e "端口: ${CYAN}${HY_PORT}${PLAIN}"
 echo -e "密码: ${CYAN}${HY_PASS}${PLAIN}"
-echo -e "IP: ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e "IP/域名: ${CYAN}${SERVER_IP}${PLAIN}"
 echo ""
 echo -e "${GREEN}分享链接:${PLAIN}"
 echo -e "hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Podman-${HY_PORT}"
 echo ""
-echo "重启: pkill hysteria; nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &"
