@@ -11,6 +11,10 @@ youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
 
 donate: https://jake712.com/?p=120
 
+加強版離散跳動端口,更穩、更不容易被限速
+```
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/install.sh | bash -s -- -p 主端口 -r "端口2,端口3,端口4,端口5,端口6" -i 出口IP
+```
 
 如出現這錯誤
 
