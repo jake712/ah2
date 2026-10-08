@@ -1,7 +1,7 @@
 #!/bin/sh
-# Hysteria 2 Alpine V3.8 - 双栈/IPV6兼容版
-# 基于 jake712 V3.7 fix
-# 修复: V3.7只支持v4, v6下永远拿不到IP
+# Hysteria 2 Alpine V3.7 - NAT/Podman/LXC 低内存兼容 + IP检测修复版
+# 基于 jake712 V3.6 fix
+# 修复: V3.6 dig 语法反了导致出口IP永远拿不到 + curl ipv6超时
 
 set -e
 
@@ -18,7 +18,7 @@ done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Alpine V3.8 双栈/Podman修复版 ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 Alpine V3.7 低内存/Podman修复版 ===${PLAIN}"
 echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date)"
 
 # ===== [1/6] 基础依赖 - 低内存优化 =====
@@ -95,7 +95,7 @@ download_ok=0
 for i in 1 2 3; do
   echo "尝试下载 $HY_URL (第 $i 次)"
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL --max-time 30 -o /tmp/hysteria "$HY_URL"; then download_ok=1; break; fi
+    if curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL"; then download_ok=1; break; fi
   fi
   if command -v wget >/dev/null 2>&1; then
     if wget -q --timeout=30 -O /tmp/hysteria "$HY_URL"; then download_ok=1; break; fi
@@ -107,7 +107,7 @@ if [ "$download_ok" != "1" ] || [ ! -s /tmp/hysteria ]; then
   echo -e "${RED}下载失败，尝试备用镜像...${PLAIN}"
   for mirror in "https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}" "https://ghproxy.net/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"; do
     echo "尝试镜像 $mirror"
-    curl -fsSL --max-time 30 -o /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
+    curl -4fsSL --max-time 30 -o /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
     wget -q --timeout=30 -O /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
   done
 fi
@@ -198,25 +198,17 @@ if command -v ss >/dev/null 2>&1; then
 fi
 tail -n 20 /var/log/hysteria.log 2>/dev/null || true
 
-# ===== [6/6] IP检测 V3.8 双栈修复版 =====
-echo -e "${YELLOW}[6/6] IP检测 V3.8 双栈...${PLAIN}"
-
-is_ipv6() {
-  case "$1" in *:*) return 0;; *) return 1;; esac
-}
+# ===== [6/6] IP检测 V3.7 修复版 =====
+echo -e "${YELLOW}[6/6] IP检测 V3.7 修复...${PLAIN}"
 
 is_private_ip() {
   local ip=$1
   [ -z "$ip" ] && return 0
-  # IPv6 私网/保留
-  case "$ip" in
-    ::1|::|fe80:*|fc00:*|fd00:*|2001:db8:*|2002:*|::ffff:*|::ffff:0:0:*) return 0 ;;
-  esac
-  # IPv4 私网
   case "$ip" in
     0.0.0.0|10.*|192.168.*|127.*|169.254.*) return 0 ;;
     172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*) return 0 ;;
   esac
+  # 100.64.0.0/10 = 100.64-127.x.x
   if echo "$ip" | grep -Eq '^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.'; then return 0; fi
   return 1
 }
@@ -227,43 +219,35 @@ get_ssh_ip() {
     for f in /proc/[0-9]*/environ; do
       [ -f "$f" ] || continue
       ip=$(tr '\0' '\n' < "$f" 2>/dev/null | grep '^SSH_CONNECTION=' | cut -d= -f2 | awk '{print $3}' | tail -n1)
-      if [ -n "$ip" ]; then echo "$ip"; return; fi
+      if echo "$ip" | grep -Eq '^[0-9.]+$' && [ -n "$ip" ]; then echo "$ip"; return; fi
     done
   fi
-  ss -tn 2>/dev/null | grep ':22' | awk '{print $4}' | rev | cut -d: -f2- | rev | sed 's/^\[//;s/\]$//' | grep -v '^127\.' | head -n1
+  # 兼容 busybox ss 没有 -H
+  ss -tn 2>/dev/null | grep ':22' | awk '{print $4}' | cut -d: -f1 | grep -E '^[0-9.]+$' | grep -v '^127\.' | head -n1
 }
 
 get_pub_ip() {
   local ip
-  # --- IPv4 ---
+  # Fix: @server 要在前面, 原来写反了
   if command -v dig >/dev/null 2>&1; then
     for ns in "208.67.222.222" "208.67.220.220" "8.8.8.8" "1.1.1.1"; do
       ip=$(dig +short +time=2 +tries=1 @${ns} myip.opendns.com 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
       if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
     done
+    ip=$(dig +short +time=2 +tries=1 @8.8.8.8 TXT o-o.myaddr.l.google.com 2>/dev/null | tr -d '"' | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+    if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
   fi
+  # Fix: 加 -4 强制IPv4，防止Alpine走IPv6超时
   if command -v curl >/dev/null 2>&1; then
-    for api in "https://api4.ipify.org" "https://ifconfig.me/ip" "https://ip.sb" "http://api.ipify.org" "https://icanhazip.com"; do
+    for api in "https://api4.ipify.org" "https://ifconfig.me/ip" "https://ip.sb" "http://api.ipify.org" "https://icanhazip.com" "https://checkip.amazonaws.com"; do
       ip=$(curl -4fsSL --max-time 4 "$api" 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
       if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
-      # 不强制-4的兜底
-      ip=$(curl -fsSL --max-time 4 "$api" 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
-      if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
-    done
-  fi
-  # --- IPv6 ---
-  if command -v curl >/dev/null 2>&1; then
-    for api in "https://api6.ipify.org" "https://api64.ipify.org" "https://ifconfig.co" "https://icanhazip.com"; do
-      ip=$(curl -6fsSL --max-time 4 "$api" 2>/dev/null | tr -d '\r' | grep -Eo '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F:]{0,4}' | head -n1)
-      if [ -n "$ip" ] && echo "$ip" | grep -q ":" && ! is_private_ip "$ip"; then echo "$ip"; return; fi
-      ip=$(curl -fsSL --max-time 4 "$api" 2>/dev/null | tr -d '\r' | grep -Eo '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F:]{0,4}' | head -n1)
-      if [ -n "$ip" ] && echo "$ip" | grep -q ":" && ! is_private_ip "$ip"; then echo "$ip"; return; fi
     done
   fi
   if command -v wget >/dev/null 2>&1; then
-    for api in "https://api6.ipify.org" "https://ifconfig.co"; do
-      ip=$(wget -qO- --timeout=4 "$api" 2>/dev/null | grep -Eo '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F:]{0,4}' | head -n1)
-      if [ -n "$ip" ] && echo "$ip" | grep -q ":" && ! is_private_ip "$ip"; then echo "$ip"; return; fi
+    for api in "https://api4.ipify.org" "https://ifconfig.me" "http://icanhazip.com"; do
+      ip=$(wget -qO- --timeout=4 "$api" 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+      if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
     done
   fi
 }
@@ -301,30 +285,23 @@ fi
 if [ -z "$SERVER_IP" ]; then
   echo -e ""
   echo -e "${RED}========== 获取IP失败 ==========${PLAIN}"
-  echo -e "在 Podman/NAT 容器中，请在宿主机执行: curl -s https://api64.ipify.org"
+  echo -e "在 Podman/NAT 容器中，请在宿主机执行: curl -s https://api4.ipify.org"
   echo -e "然后重新安装: bash $0 -p $HY_PORT -i 你的公网IP"
   SERVER_IP="YOUR_PUBLIC_IP"
 fi
 
-# IPv6 分享链接必须加 []
-if is_ipv6 "$SERVER_IP" && [ "$SERVER_IP" != "YOUR_PUBLIC_IP" ]; then
-  LINK_IP="[$SERVER_IP]"
-else
-  LINK_IP="$SERVER_IP"
-fi
-
 echo ""
-echo -e "${GREEN}========== V3.8 完成 ==========${PLAIN}"
+echo -e "${GREEN}========== V3.7 完成 ==========${PLAIN}"
 echo -e "端口: ${CYAN}${HY_PORT}${PLAIN}"
 echo -e "密码: ${CYAN}${HY_PASS}${PLAIN}"
 echo -e "IP: ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e ""
 echo -e "分享链接:"
-echo -e "${GREEN}hysteria2://${HY_PASS}@${LINK_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2-V3.8-IPv6${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2-V3.7-Podman${PLAIN}"
 echo -e ""
 echo -e "日志: tail -f /var/log/hysteria.log"
 echo -e "重启: /usr/local/bin/hy2-restart.sh 或 rc-service hysteria restart"
-echo -e "记得放行 UDP ${CYAN}${HY_PORT}${PLAIN} (v6需放行 ip6tables)"
+echo -e "记得放行 UDP ${CYAN}${HY_PORT}${PLAIN}"
 if [ "$SERVER_IP" = "YOUR_PUBLIC_IP" ]; then
   echo -e "${RED}注意: 请替换 YOUR_PUBLIC_IP 为真实公网IP${PLAIN}"
 fi
