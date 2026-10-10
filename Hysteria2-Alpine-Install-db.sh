@@ -1,6 +1,6 @@
 #!/bin/sh
-# Hysteria 2 Debian V1.0 - NAT/Podman/LXC 低内存兼容 + IP检测修复版
-# 基于 jake712 Alpine V3.7 转 Debian版
+# Hysteria 2 Debian V1.1 - NAT/Podman/LXC 低内存兼容 + IP检测修复版 + 证书pin版
+# 基于 jake712 V1.0 修改
 # 适配: Debian 11/12/13, Ubuntu 20.04+, Podman无systemd容器
 
 set -e
@@ -18,7 +18,7 @@ done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Debian V1.0 Podman修复版 ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 Debian V1.1 Podman+Cert版 ===${PLAIN}"
 echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
 
 # ===== [1/6] 基础依赖 - Debian适配 =====
@@ -175,7 +175,6 @@ cat /etc/hysteria/config.yaml
 # ===== [5/6] 服务 - Debian/Podman兼容 =====
 echo -e "${YELLOW}[5/6] 配置服务...${PLAIN}"
 
-# 创建通用的重启脚本 (Debian和Podman都可用)
 cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
 #!/bin/sh
 pkill -f "hysteria.*config.yaml" || true
@@ -189,7 +188,6 @@ echo "已重启，日志: tail -f /var/log/hysteria.log"
 RESTART
 chmod +x /usr/local/bin/hy2-restart.sh
 
-# 判断是否在 systemd 环境
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   echo -e "${GREEN}检测到 systemd，使用 systemd 服务${PLAIN}"
   cat > /etc/systemd/system/hysteria.service <<EOF
@@ -225,7 +223,7 @@ if command -v ss >/dev/null 2>&1; then
 fi
 tail -n 20 /var/log/hysteria.log 2>/dev/null || true
 
-# ===== [6/6] IP检测 V3.7 修复版 (原样保留) =====
+# ===== [6/6] IP检测 V3.7 修复版 =====
 echo -e "${YELLOW}[6/6] IP检测 V3.7 修复...${PLAIN}"
 
 is_private_ip() {
@@ -313,17 +311,71 @@ if [ -z "$SERVER_IP" ]; then
   SERVER_IP="YOUR_PUBLIC_IP"
 fi
 
+# ===== [7/7] 新增：证书处理与客户端配置 =====
+echo -e "${YELLOW}[7/7] 生成证书pin与客户端配置...${PLAIN}"
+
+# 计算 pinSHA256 (Hysteria官方推荐方式)
+CERT_PIN=""
+if [ -f /etc/hysteria/cert.crt ]; then
+  if openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null > /tmp/pin.tmp; then
+    CERT_PIN=$(cat /tmp/pin.tmp | tr -d '\n')
+  else
+    # 兼容旧版 openssl
+    CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null | tr -d '\n')
+  fi
+  rm -f /tmp/pin.tmp
+fi
+
+# 提取证书信息
+CERT_DATES=$(openssl x509 -in /etc/hysteria/cert.crt -noout -dates 2>/dev/null | tr '\n' ' ')
+CERT_FINGERPRINT=$(openssl x509 -in /etc/hysteria/cert.crt -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+
+# 生成客户端YAML (更安全的方式)
+cat > /root/hy2-client.yaml <<EOF
+server: ${SERVER_IP}:${HY_PORT}
+auth: ${HY_PASS}
+tls:
+  sni: bing.com
+  pinSHA256: ${CERT_PIN}
+  # 如果 pin 失效，回退用 insecure
+  # insecure: true
+socks5:
+  listen: 127.0.0.1:1080
+http:
+  listen: 127.0.0.1:8080
+EOF
+
+# 备份证书到 root 方便下载
+cp /etc/hysteria/cert.crt /root/hy2-cert.crt
+cp /etc/hysteria/cert.crt /etc/hysteria/client.crt
+chmod 644 /root/hy2-cert.crt /etc/hysteria/client.crt
+
 echo ""
-echo -e "${GREEN}========== Debian V1.0 完成 ==========${PLAIN}"
+echo -e "${GREEN}========== Debian V1.1 完成 (证书增强版) ==========${PLAIN}"
 echo -e "端口: ${CYAN}${HY_PORT}${PLAIN}"
 echo -e "密码: ${CYAN}${HY_PASS}${PLAIN}"
 echo -e "IP: ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e "证书: ${CYAN}/etc/hysteria/cert.crt${PLAIN}"
+echo -e "指纹: ${CYAN}${CERT_FINGERPRINT}${PLAIN}"
+echo -e "pinSHA256: ${CYAN}${CERT_PIN}${PLAIN}"
+echo -e "有效期: ${CYAN}${CERT_DATES}${PLAIN}"
 echo -e ""
-echo -e "分享链接:"
-echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Debian-Hy2-V1.0-Podman${PLAIN}"
+echo -e "${YELLOW}--- 客户端配置已生成: /root/hy2-client.yaml ---${PLAIN}"
+cat /root/hy2-client.yaml
+echo -e ""
+echo -e "${GREEN}--- 分享链接 (推荐-安全) ---${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${CERT_PIN}#Debian-Hy2-V1.1-Pin${PLAIN}"
+echo -e ""
+echo -e "${YELLOW}--- 分享链接 (兼容-需insecure) ---${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Debian-Hy2-V1.1-Insecure${PLAIN}"
+echo -e ""
+echo -e "${CYAN}--- 证书内容 (可供客户端手动导入) ---${PLAIN}"
+cat /etc/hysteria/cert.crt
 echo -e ""
 echo -e "日志: tail -f /var/log/hysteria.log"
 echo -e "重启: /usr/local/bin/hy2-restart.sh 或 systemctl restart hysteria"
+echo -e "客户端配置: cat /root/hy2-client.yaml"
+echo -e "下载证书: cat /root/hy2-cert.crt"
 echo -e "记得放行 UDP ${CYAN}${HY_PORT}${PLAIN}"
 if [ "$SERVER_IP" = "YOUR_PUBLIC_IP" ]; then
   echo -e "${RED}注意: 请替换 YOUR_PUBLIC_IP 为真实公网IP${PLAIN}"
