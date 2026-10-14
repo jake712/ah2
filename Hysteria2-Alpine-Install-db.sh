@@ -1,6 +1,6 @@
 #!/bin/sh
-# Hysteria 2 Debian V1.2 - Podman/LXC/NAT + 证书pin + Karing修复完整版
-# 基于 V1.1 修改 - 修复 pinSHA256 URL编码导致 karing/clash.meta 无法导入问题
+# Hysteria 2 Debian V1.3 - Podman/LXC/NAT + 证书pin + Karing修复 + 保活修复版
+# 基于 V1.2 修改 - 修复几分钟后不通 (nohup被回收) 问题
 # 适配: Debian 11/12/13, Ubuntu 20.04+, Podman无systemd容器
 
 set -e
@@ -18,7 +18,7 @@ done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Debian V1.2 Karing修复版 ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 Debian V1.3 保活修复版 ===${PLAIN}"
 echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
 
 # ===== [1/7] 基础依赖 =====
@@ -118,42 +118,107 @@ masquerade:
 tls:
   cert: /etc/hysteria/cert.crt
   key: /etc/hysteria/key.key
+# V1.3 新增: 优化 QUIC 保活，避免 NAT 超时
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  keepAlivePeriod: 10s
+ignoreClientBandwidth: false
 EOF
 cat /etc/hysteria/config.yaml
 
-# ===== [5/7] 服务 =====
-echo -e "${YELLOW}[5/7] 配置服务...${PLAIN}"
+# ===== [5/7] 服务 - V1.3 核心修复 =====
+echo -e "${YELLOW}[5/7] 配置服务 (V1.3 保活修复)...${PLAIN}"
+
+# 判断是否真正在 systemd 环境
+IS_SYSTEMD=0
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  # PID 1 是 systemd 才算真 systemd
+  if [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ] || [ "$(cat /proc/1/comm 2>/dev/null)" = "systemd" ]; then
+    IS_SYSTEMD=1
+  fi
+fi
+echo -e "Systemd 检测: ${IS_SYSTEMD} (1=真systemd, 0=容器nohup模式)"
+
 cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
 #!/bin/sh
-pkill -f "hysteria.*config.yaml" || true
-sleep 1
-if systemctl is-active --quiet hysteria 2>/dev/null; then systemctl restart hysteria
-else nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & fi
+# V1.3 重启脚本 - 自动识别 systemd
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet hysteria 2>/dev/null; then
+  echo "使用 systemd 重启..."
+  systemctl restart hysteria
+else
+  echo "使用 nohup 重启 (容器模式)..."
+  pkill -9 -f "hysteria.*config.yaml" 2>/dev/null || true
+  pkill -9 -f "/usr/local/bin/hysteria server" 2>/dev/null || true
+  sleep 1
+  # 使用 setsid 彻底脱离终端，避免 SSH 断开被回收
+  setsid nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+  sleep 1
+fi
+ss -tulpn 2>/dev/null | grep -E "hysteria" || ss -unlp 2>/dev/null | grep hysteria || true
 echo "已重启，日志: tail -f /var/log/hysteria.log"
 RESTART
 chmod +x /usr/local/bin/hy2-restart.sh
 
-if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+if [ "$IS_SYSTEMD" = "1" ]; then
+  echo -e "${GREEN}检测到真实 systemd，使用 systemd 保活模式${PLAIN}"
   cat > /etc/systemd/system/hysteria.service <<EOF
 [Unit]
-Description=Hysteria2 Server V1.2
-After=network.target
+Description=Hysteria2 Server V1.3 Fixed - 保活修复版
+After=network.target nss-lookup.target
+Wants=network-online.target
+
 [Service]
 Type=simple
+User=root
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=3
-LimitNOFILE=65535
+LimitNOFILE=infinity
+LimitNPROC=infinity
+Environment=HYSTERIA_LOG_LEVEL=info
+
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload; systemctl enable hysteria >/dev/null 2>&1 || true; systemctl restart hysteria 2>&1 || systemctl start hysteria 2>&1 || true; sleep 2
+  systemctl daemon-reload
+  systemctl enable hysteria >/dev/null 2>&1 || true
+  systemctl restart hysteria 2>&1 || systemctl start hysteria 2>&1 || true
+  sleep 2
+  systemctl status hysteria --no-pager -l 2>/dev/null | head -n 20 || true
 else
-  pkill -f "hysteria.*config.yaml" 2>/dev/null || true; sleep 1
-  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & sleep 2
+  echo -e "${YELLOW}检测到 Podman/LXC 无systemd容器，使用 setsid+nohup+crontab 保活模式${PLAIN}"
+  pkill -9 -f "hysteria.*config.yaml" 2>/dev/null || true
+  pkill -9 -f "/usr/local/bin/hysteria server" 2>/dev/null || true
+  sleep 1
+  setsid nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+  sleep 2
+  # 加上 crontab 保活，重启后自动起来
+  (crontab -l 2>/dev/null | grep -v "hysteria server"; echo "@reboot sleep 10 && /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &") | crontab - 2>/dev/null || true
 fi
-ss -tulpn 2>/dev/null | grep -E "$HY_PORT|hysteria" || true
-tail -n 10 /var/log/hysteria.log 2>/dev/null || true
+
+# 自动放行防火墙 (V1.3 新增)
+echo -e "${YELLOW}放行防火墙 UDP ${HY_PORT}...${PLAIN}"
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || true
+  iptables -C INPUT -p tcp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || true
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  firewall-cmd --add-port=${HY_PORT}/udp --permanent 2>/dev/null || true
+  firewall-cmd --add-port=${HY_PORT}/tcp --permanent 2>/dev/null || true
+  firewall-cmd --reload 2>/dev/null || true
+fi
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active"; then
+  ufw allow ${HY_PORT}/udp 2>/dev/null || true
+  ufw allow ${HY_PORT}/tcp 2>/dev/null || true
+fi
+
+ss -tulpn 2>/dev/null | grep -E "$HY_PORT|hysteria" || ss -unlp 2>/dev/null | grep -E "$HY_PORT|hysteria" || true
+tail -n 15 /var/log/hysteria.log 2>/dev/null || true
 
 # ===== [6/7] IP检测 V3.7 =====
 echo -e "${YELLOW}[6/7] IP检测...${PLAIN}"
@@ -197,7 +262,6 @@ urlencode() {
 
 CERT_PIN=""; CERT_PIN_ENC=""; CERT_FPR=""; CERT_DATES=""
 if [ -f /etc/hysteria/cert.crt ]; then
-  # pinSHA256 = base64(sha256(spki))
   if openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null > /tmp/pin.tmp; then
     CERT_PIN=$(cat /tmp/pin.tmp | tr -d '\n')
   else
@@ -209,12 +273,10 @@ if [ -f /etc/hysteria/cert.crt ]; then
   CERT_DATES=$(openssl x509 -in /etc/hysteria/cert.crt -noout -dates 2>/dev/null | tr '\n' ' ')
 fi
 
-# 备份证书
 cp /etc/hysteria/cert.crt /root/hy2-cert.crt 2>/dev/null || true
 cp /etc/hysteria/cert.crt /etc/hysteria/client.crt 2>/dev/null || true
 chmod 644 /root/hy2-cert.crt 2>/dev/null || true
 
-# 1. sing-box / 官方客户端 YAML
 cat > /root/hy2-client.yaml <<EOF
 server: ${SERVER_IP}:${HY_PORT}
 auth: ${HY_PASS}
@@ -227,9 +289,7 @@ http:
   listen: 127.0.0.1:8080
 EOF
 
-# 2. Clash.Meta / Karing 专用 YAML (最稳)
 cat > /root/hy2-clash.yaml <<EOF
-# Karing / Clash.Meta / Mihomo 专用 - 直接导入
 proxies:
   - name: Hy2-${SERVER_IP}
     type: hysteria2
@@ -239,12 +299,8 @@ proxies:
     sni: bing.com
     skip-cert-verify: false
     pinSHA256: ${CERT_PIN}
-    # 如果上面在你的Karing版本报错，注释掉上面两行，启用下面两行
-    # skip-cert-verify: true
-    # fingerprint: chrome
 EOF
 
-# 3. sing-box JSON (Karing 也支持)
 cat > /root/hy2-singbox.json <<EOF
 {
   "type": "hysteria2",
@@ -262,9 +318,8 @@ cat > /root/hy2-singbox.json <<EOF
 }
 EOF
 
-# ===== 最终输出 =====
 echo ""
-echo -e "${GREEN}========== Debian V1.2 完成 (Karing修复版) ==========${PLAIN}"
+echo -e "${GREEN}========== Debian V1.3 完成 (保活修复版) ==========${PLAIN}"
 echo -e "端口: ${CYAN}${HY_PORT}${PLAIN} | 密码: ${CYAN}${HY_PASS}${PLAIN} | IP: ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e "证书指纹: ${CYAN}${CERT_FPR}${PLAIN}"
 echo -e "pin原始: ${CYAN}${CERT_PIN}${PLAIN}"
@@ -288,6 +343,7 @@ echo -e ""
 echo -e "管理命令:"
 echo -e "  日志: tail -f /var/log/hysteria.log"
 echo -e "  重启: /usr/local/bin/hy2-restart.sh"
+echo -e "  状态: systemctl status hysteria (systemd) 或 ps aux | grep hysteria (容器)"
 echo -e "  客户端: cat /root/hy2-client.yaml"
 echo -e "  Clash: cat /root/hy2-clash.yaml"
 echo -e "  JSON: cat /root/hy2-singbox.json"
