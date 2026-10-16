@@ -1,7 +1,7 @@
 #!/bin/bash
-# Hysteria2 Universal 完整版 V2.5 Final - Debian/Alpine 自選修復版
-# 修復點: 所有 [! 和!= 前後都加了空格, 修復 config.yaml 截斷
-# 用法: curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-Install-db.sh | bash -s -- -p 33950 -i 199.21.173.21 -o auto
+# Hysteria2 Universal V2.6 Final Fixed - Debian & Alpine 自選
+# 完全修復: [ "$(id -u)" !=, [ !, || !, if !, && !
+# 用法: curl ... | bash -s -- -p 33950 -i 199.21.173.21 -o auto
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
@@ -17,7 +17,7 @@ while getopts "p:w:i:o:h" opt; do
   esac
 done
 
-if [ "$(id -u)"!= "0" ]; then
+if [ "$(id -u)" != "0" ]; then
   echo -e "${RED}请用 root 运行${PLAIN}"
   exit 1
 fi
@@ -25,7 +25,7 @@ fi
 detect_os() {
   local OS_TYPE="unknown"
   if [ -f /etc/os-release ]; then
-   . /etc/os-release
+    . /etc/os-release
     case "$ID" in
       alpine) OS_TYPE="alpine" ;;
       debian|ubuntu) OS_TYPE="debian" ;;
@@ -53,29 +53,28 @@ else
   if [ "$DETECTED" = "unknown" ]; then FINAL_OS="debian"; else FINAL_OS="$DETECTED"; fi
 fi
 
-echo -e "${GREEN}=== Hysteria2 Universal V2.5 [${FINAL_OS}] ===${PLAIN}"
-echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
+echo -e "${GREEN}=== Hysteria2 Universal V2.6 Final [${FINAL_OS}] ===${PLAIN}"
 
 APK_UPDATED=0; APT_UPDATED=0
 
 install_deps_alpine() {
-  echo -e "${YELLOW}[1/7] 检查依赖 (Alpine)...${PLAIN}"
+  echo -e "${YELLOW}[1/7] Alpine 依赖...${PLAIN}"
   cat /etc/resolv.conf | head -n 5
   if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
     echo -e "${YELLOW}检测到 Podman，保留原有 DNS${PLAIN}"
   else
-    if [! -s /etc/resolv.conf ] ||! grep -q "nameserver" /etc/resolv.conf; then
+    if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
       echo "nameserver 1.1.1.1" > /etc/resolv.conf
       echo "nameserver 8.8.8.8" >> /etc/resolv.conf
     fi
   fi
   if [ "$APK_UPDATED" -eq 0 ]; then apk update; APK_UPDATED=1; fi
-  if! command -v curl >/dev/null 2>&1 &&! command -v wget >/dev/null 2>&1; then apk add --no-cache curl; fi
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then apk add --no-cache curl; fi
   apk add --no-cache openssl bind-tools iproute2 procps ca-certificates python3 || true
 }
 
 install_deps_debian() {
-  echo -e "${YELLOW}[1/7] 检查依赖 (Debian)...${PLAIN}"
+  echo -e "${YELLOW}[1/7] Debian 依赖...${PLAIN}"
   export DEBIAN_FRONTEND=noninteractive
   if [ "$APT_UPDATED" -eq 0 ]; then apt-get update -y; APT_UPDATED=1; fi
   apt-get install -y curl wget openssl bind9-dnsutils iproute2 procps ca-certificates python3 cron || apt-get install -y curl wget openssl iproute2 procps ca-certificates python3 || true
@@ -106,18 +105,18 @@ for i in 1 2 3; do
   if command -v wget >/dev/null 2>&1; then wget -q --timeout=30 -O /tmp/hysteria "$HY_URL" && download_ok=1 && break; fi
   sleep 1
 done
-if [ "$download_ok"!= "1" ] || [! -s /tmp/hysteria ]; then
+if [ "$download_ok" != "1" ] || [ ! -s /tmp/hysteria ]; then
   for mirror in "https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}" "https://ghproxy.net/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"; do
     curl -4fsSL --max-time 30 -o /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
     wget -q --timeout=30 -O /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
   done
 fi
-if [! -s /tmp/hysteria ]; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
+if [ ! -s /tmp/hysteria ]; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
 mv /tmp/hysteria /usr/local/bin/hysteria; chmod +x /usr/local/bin/hysteria
 /usr/local/bin/hysteria version || true
 
 echo -e "${YELLOW}[4/7] 生成配置...${PLAIN}"
-if [! -f /etc/hysteria/cert.crt ] || [! -f /etc/hysteria/key.key ]; then
+if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
   openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || openssl genrsa -out /etc/hysteria/key.key 2048
   openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650
@@ -173,7 +172,7 @@ INIT
 else
   cat > /etc/systemd/system/hysteria.service <<EOF
 [Unit]
-Description=Hysteria2 Server V2.5 Universal
+Description=Hysteria2 Server V2.6 Universal
 After=network.target
 [Service]
 Type=simple
@@ -190,12 +189,7 @@ fi
 ss -tulpn 2>/dev/null | grep -E "$HY_PORT|hysteria" || true
 tail -n 10 /var/log/hysteria.log 2>/dev/null || journalctl -u hysteria -n 10 --no-pager 2>/dev/null || true
 
-# ===== [6/7] IP檢測 V3.7 =====
 echo -e "${YELLOW}[6/7] IP检测...${PLAIN}"
-is_private_ip() {
-  case "$1" in 10.*|192.168.*|127.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|0.0.0.0) return 0;; esac
-  return 1
-}
 get_pub_ip() {
   curl -4fsSL --max-time 4 https://api4.ipify.org 2>/dev/null || curl -4fsSL --max-time 4 https://ifconfig.me 2>/dev/null || wget -qO- --timeout=4 https://api4.ipify.org 2>/dev/null || echo ""
 }
@@ -207,11 +201,9 @@ CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | 
 if [ -z "$CERT_PIN" ]; then CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null | tr -d '\n'); fi
 CERT_PIN_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$CERT_PIN" 2>/dev/null || echo "$CERT_PIN")
 
-echo -e "${GREEN}========== V2.5 完成 [${FINAL_OS}] ==========${PLAIN}"
+echo -e "${GREEN}========== V2.6 完成 [${FINAL_OS}] ==========${PLAIN}"
 echo -e "端口: ${CYAN}${HY_PORT}${PLAIN} | 密码: ${CYAN}${HY_PASS}${PLAIN} | IP: ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e "pin: ${CYAN}${CERT_PIN}${PLAIN}"
 echo -e ""
 echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Hy2-Insecure${PLAIN}"
 echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${CERT_PIN_ENC}#Hy2-Pin${PLAIN}"
-echo -e ""
-echo -e "管理: /usr/local/bin/hy2-restart.sh"
