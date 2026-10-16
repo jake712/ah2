@@ -1,64 +1,111 @@
 #!/bin/sh
-# Hysteria 2 Alpine V1.2 - Podman/LXC/NAT + 证书pin + Karing修复完整版
-# 基于 Debian V1.2 移植 - Alpine 3.18+ / OpenRC
-# 适配: Alpine, Podman无systemd容器
+# Hysteria 2 Universal V2.0 - Debian & Alpine 自选 + 自动识别版
+# 支持: Debian 11/12/13, Ubuntu 20.04+, Alpine 3.18+ (OpenRC/Podman/LXC/NAT)
+# 原版: Alpine V1.2 Karing修复版 -> 重构为通用版
 
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
 
-while getopts "p:w:i:h" opt; do
+CUSTOM_PORT=""
+CUSTOM_PASSWORD=""
+CUSTOM_IP=""
+CUSTOM_OS="auto"
+
+while getopts "p:w:i:o:h" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) echo "用法: $0 [-p 端口] [-w 密码] [-i 公网IP]"; exit 0 ;;
+    o) CUSTOM_OS=$OPTARG ;;
+    h) echo "用法: $0 [-o debian|alpine|auto] [-p 端口] [-w 密码] [-i 公网IP]"
+       echo "  -o auto    自动识别 (默认)"
+       echo "  -o debian  强制Debian系 (apt+systemd)"
+       echo "  -o alpine  强制Alpine (apk+OpenRC)"
+       exit 0 ;;
   esac
 done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Alpine V1.2 Karing修复版 ===${PLAIN}"
-echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
+# ===== OS 检测 =====
+detect_os() {
+  OS_TYPE="unknown"
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    case "$ID" in
+      alpine) OS_TYPE="alpine" ;;
+      debian|ubuntu|linuxmint|pop|deepin|kali) OS_TYPE="debian" ;;
+    esac
+    # ID_LIKE 兜底
+    if [ "$OS_TYPE" = "unknown" ]; then
+      case "$ID_LIKE" in
+        *debian*|*ubuntu*) OS_TYPE="debian" ;;
+        *alpine*) OS_TYPE="alpine" ;;
+      esac
+    fi
+  fi
+  # 二次判断: 有 apk 就是 alpine, 有 apt 就是 debian
+  if [ "$OS_TYPE" = "unknown" ]; then
+    if command -v apk >/dev/null 2>&1; then OS_TYPE="alpine"
+    elif command -v apt-get >/dev/null 2>&1; then OS_TYPE="debian"
+    fi
+  fi
+  echo "$OS_TYPE"
+}
 
-# ===== [1/7] 基础依赖 =====
-echo -e "${YELLOW}[1/7] 检查依赖 (Alpine低内存模式)...${PLAIN}"
-cat /etc/resolv.conf | head -n 5
-cat /proc/meminfo 2>/dev/null | grep -E "MemTotal|MemAvailable" || free -m 2>/dev/null || true
-
-if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
-  echo -e "${YELLOW}检测到 Podman (dns.podman)，保留原有 DNS${PLAIN}"
+if [ "$CUSTOM_OS" = "debian" ] || [ "$CUSTOM_OS" = "ubuntu" ]; then
+  FINAL_OS="debian"
+elif [ "$CUSTOM_OS" = "alpine" ]; then
+  FINAL_OS="alpine"
 else
-  if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
-    echo "nameserver 1.1.1.1" > /etc/resolv.conf
-    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  DETECTED=$(detect_os)
+  if [ "$DETECTED" = "unknown" ]; then
+    echo -e "${YELLOW}无法自动识别系统，请选择:${PLAIN}"
+    echo "  1) Debian / Ubuntu (systemd)"
+    echo "  2) Alpine (OpenRC)"
+    printf "输入 [1/2]: "; read CHOOSE
+    case "$CHOOSE" in 2) FINAL_OS="alpine";; *) FINAL_OS="debian";; esac
+  else
+    FINAL_OS="$DETECTED"
   fi
 fi
 
-if ! command -v apk >/dev/null 2>&1; then echo -e "${RED}未检测到 apk，请确认是 Alpine 系统${PLAIN}"; exit 1; fi
+echo -e "${GREEN}=== Hysteria2 Universal V2.0 [${FINAL_OS}] Karing修复版 ===${PLAIN}"
+echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | OS参数: $CUSTOM_OS -> 最终: $FINAL_OS"
 
+# ===== 通用函数 =====
 APK_UPDATED=0
-apk_update() {
-  if [ $APK_UPDATED -eq 0 ]; then echo -e "${YELLOW}apk update...${PLAIN}"; apk update; APK_UPDATED=1; fi
-}
-ensure_cmd() {
-  CMD=$1; PKG=$2
-  if ! command -v "$CMD" >/dev/null 2>&1; then
-    echo -e "${YELLOW}安装缺失: $CMD ($PKG)...${PLAIN}"
-    apk_update; apk add --no-cache "$PKG" 2>&1 || true
-  else echo -e "已存在: $CMD"; fi
+APT_UPDATED=0
+
+install_deps_alpine() {
+  echo -e "${YELLOW}[1/7] 检查依赖 (Alpine低内存模式)...${PLAIN}"
+  cat /etc/resolv.conf | head -n 5
+  if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
+    echo -e "${YELLOW}检测到 Podman，保留原有 DNS${PLAIN}"
+  else
+    if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
+      echo "nameserver 1.1.1.1" > /etc/resolv.conf; echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+    fi
+  fi
+  if ! command -v apk >/dev/null 2>&1; then echo -e "${RED}未检测到 apk${PLAIN}"; exit 1; fi
+  apk_update() { if [ $APK_UPDATED -eq 0 ]; then echo -e "${YELLOW}apk update...${PLAIN}"; apk update; APK_UPDATED=1; fi; }
+  ensure_cmd() { CMD=$1; PKG=$2; if ! command -v "$CMD" >/dev/null 2>&1; then echo -e "${YELLOW}安装缺失: $CMD ($PKG)...${PLAIN}"; apk_update; apk add --no-cache "$PKG" 2>&1 || true; else echo -e "已存在: $CMD"; fi; }
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then apk_update; apk add --no-cache curl || true; fi
+  ensure_cmd openssl openssl; ensure_cmd dig bind-tools; ensure_cmd ss iproute2; ensure_cmd pkill procps
+  if [ ! -f /etc/ssl/certs/ca-certificates.crt ] && [ ! -f /etc/ssl/certs/ca-bundle.crt ]; then apk_update; apk add --no-cache ca-certificates 2>&1 || true; update-ca-certificates 2>/dev/null || true; fi
 }
 
-# Alpine 包名映射
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then apk_update; apk add --no-cache curl || true; fi
-ensure_cmd openssl openssl
-ensure_cmd dig bind-tools
-ensure_cmd ss iproute2
-ensure_cmd pkill procps
-
-if [ ! -f /etc/ssl/certs/ca-certificates.crt ] && [ ! -f /etc/ssl/certs/ca-bundle.crt ]; then
-  apk_update; apk add --no-cache ca-certificates 2>&1 || true; update-ca-certificates 2>/dev/null || true
-fi
+install_deps_debian() {
+  echo -e "${YELLOW}[1/7] 检查依赖 (Debian系)...${PLAIN}"
+  if ! command -v apt-get >/dev/null 2>&1; then echo -e "${RED}未检测到 apt-get${PLAIN}"; exit 1; fi
+  apt_update() { if [ $APT_UPDATED -eq 0 ]; then echo -e "${YELLOW}apt-get update...${PLAIN}"; apt-get update -y; APT_UPDATED=1; fi; }
+  export DEBIAN_FRONTEND=noninteractive
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then apt_update; apt-get install -y curl wget || true; fi
+  apt_update
+  apt-get install -y openssl bind9-dnsutils bind9-host dnsutils iproute2 procps ca-certificates 2>&1 || apt-get install -y openssl bind9-dnsutils iproute2 procps ca-certificates || true
+  update-ca-certificates 2>/dev/null || true
+}
 
 # ===== [2/7] 参数 =====
 echo -e "${YELLOW}[2/7] 初始化参数...${PLAIN}"
@@ -69,17 +116,18 @@ else
   else HY_PASS=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 16); fi
 fi
 [ -z "$HY_PASS" ] && HY_PASS="Hy2$(date +%s | tail -c 8)"
-
 ARCH=$(uname -m)
 case "$ARCH" in x86_64|amd64) HY_ARCH="amd64";; aarch64|arm64) HY_ARCH="arm64";; armv7l|arm) HY_ARCH="arm";; *) HY_ARCH="amd64";; esac
 mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log
 chmod 700 /etc/hysteria 2>/dev/null || true
 
+# 根据系统安装依赖
+if [ "$FINAL_OS" = "alpine" ]; then install_deps_alpine; else install_deps_debian; fi
+
 # ===== [3/7] 下载 =====
 echo -e "${YELLOW}[3/7] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
 HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
-rm -f /tmp/hysteria
-download_ok=0
+rm -f /tmp/hysteria; download_ok=0
 for i in 1 2 3; do
   echo "尝试下载 $HY_URL (第 $i 次)"
   if command -v curl >/dev/null 2>&1; then curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL" && download_ok=1 && break; fi
@@ -97,7 +145,7 @@ if [ ! -s /tmp/hysteria ] || head -c 200 /tmp/hysteria 2>/dev/null | grep -qi "<
 mv /tmp/hysteria /usr/local/bin/hysteria; chmod +x /usr/local/bin/hysteria
 /usr/local/bin/hysteria version 2>&1 || true
 
-# ===== [4/7] 证书和配置 =====
+# ===== [4/7] 证书和配置 (通用) =====
 echo -e "${YELLOW}[4/7] 生成配置...${PLAIN}"
 if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
@@ -108,7 +156,6 @@ if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650
   chmod 600 /etc/hysteria/key.key
 fi
-
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${HY_PORT}
 auth:
@@ -125,62 +172,77 @@ tls:
 EOF
 cat /etc/hysteria/config.yaml
 
-# ===== [5/7] 服务 (Alpine OpenRC) =====
-echo -e "${YELLOW}[5/7] 配置服务 (Alpine OpenRC)...${PLAIN}"
+# ===== [5/7] 服务 (分支) =====
+setup_service_debian() {
+  echo -e "${YELLOW}[5/7] 配置服务 (Debian systemd)...${PLAIN}"
+  cat > /etc/systemd/system/hysteria.service <<EOF
+[Unit]
+Description=Hysteria2 Server Universal V2.0
+After=network.target
 
-# OpenRC init 脚本
-cat > /etc/init.d/hysteria <<'INIT'
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable hysteria 2>/dev/null || true
+  systemctl restart hysteria 2>&1 || systemctl start hysteria 2>&1 || true
+  sleep 2
+}
+
+setup_service_alpine() {
+  echo -e "${YELLOW}[5/7] 配置服务 (Alpine OpenRC)...${PLAIN}"
+  cat > /etc/init.d/hysteria <<'INIT'
 #!/sbin/openrc-run
 name="hysteria"
-description="Hysteria2 Server V1.2 Alpine"
+description="Hysteria2 Server V2.0 Alpine"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml"
 command_background=true
 pidfile="/run/hysteria/hysteria.pid"
 output_log="/var/log/hysteria.log"
 error_log="/var/log/hysteria.log"
-
-depend() {
-  need net
-  after firewall
-}
-
-start_pre() {
-  checkpath --directory --mode 0755 /run/hysteria
-  checkpath --file --mode 0644 /var/log/hysteria.log
-}
+depend() { need net; after firewall; }
+start_pre() { checkpath --directory --mode 0755 /run/hysteria; checkpath --file --mode 0644 /var/log/hysteria.log; }
 INIT
-chmod +x /etc/init.d/hysteria
+  chmod +x /etc/init.d/hysteria
+  if [ -f /sbin/openrc-run ] || command -v rc-service >/dev/null 2>&1; then
+    rc-update add hysteria default 2>/dev/null || true
+    rc-service hysteria restart 2>&1 || rc-service hysteria start 2>&1 || /etc/init.d/hysteria restart 2>&1 || true
+    sleep 2
+  else
+    pkill -f "hysteria.*config.yaml" 2>/dev/null || true; sleep 1
+    nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & sleep 2
+  fi
+}
 
-# 重启脚本 (兼容 OpenRC 和 无服务管理器)
+if [ "$FINAL_OS" = "alpine" ]; then setup_service_alpine; else setup_service_debian; fi
+
+# 通用重启脚本
 cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
 #!/bin/sh
-if command -v rc-service >/dev/null 2>&1 && [ -f /etc/init.d/hysteria ]; then
-  rc-service hysteria restart
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q hysteria; then
+  systemctl restart hysteria; echo "systemd 重启完成"
+elif command -v rc-service >/dev/null 2>&1 && [ -f /etc/init.d/hysteria ]; then
+  rc-service hysteria restart; echo "OpenRC 重启完成"
 else
-  pkill -f "hysteria.*config.yaml" || true
-  sleep 1
-  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+  pkill -f "hysteria.*config.yaml" || true; sleep 1
+  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & echo "nohup 重启完成"
 fi
-echo "已重启，日志: tail -f /var/log/hysteria.log"
+echo "日志: tail -f /var/log/hysteria.log 或 journalctl -u hysteria -f"
 RESTART
 chmod +x /usr/local/bin/hy2-restart.sh
 
-# 启动
-if [ -f /sbin/openrc-run ] || command -v rc-service >/dev/null 2>&1; then
-  rc-update add hysteria default 2>/dev/null || true
-  rc-service hysteria restart 2>&1 || rc-service hysteria start 2>&1 || /etc/init.d/hysteria restart 2>&1 || true
-  sleep 2
-else
-  # Podman容器没有OpenRC的情况
-  pkill -f "hysteria.*config.yaml" 2>/dev/null || true; sleep 1
-  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & sleep 2
-fi
-
 ss -tulpn 2>/dev/null | grep -E "$HY_PORT|hysteria" || ss -tulnp 2>/dev/null | grep -E "$HY_PORT|hysteria" || netstat -tulpn 2>/dev/null | grep "$HY_PORT" || true
-tail -n 10 /var/log/hysteria.log 2>/dev/null || true
+tail -n 10 /var/log/hysteria.log 2>/dev/null || journalctl -u hysteria --no-pager -n 10 2>/dev/null || true
 
-# ===== [6/7] IP检测 V3.7 =====
+# ===== [6/7] IP检测 V3.7 (通用) =====
 echo -e "${YELLOW}[6/7] IP检测...${PLAIN}"
 is_private_ip() {
   local ip=$1; [ -z "$ip" ] && return 0
@@ -209,30 +271,19 @@ else
 fi
 if [ -z "$SERVER_IP" ]; then echo -e "${RED}无法获取IP，请用 -i 指定${PLAIN}"; SERVER_IP="YOUR_PUBLIC_IP"; fi
 
-# ===== [7/7] 证书pin + Karing修复 + 客户端配置 =====
+# ===== [7/7] 证书pin + 客户端配置 =====
 echo -e "${YELLOW}[7/7] 生成证书pin与客户端配置 (Karing修复)...${PLAIN}"
-
 urlencode() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-  else
-    printf '%s' "$1" | sed -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g' -e 's/:/%3A/g'
-  fi
+  if command -v python3 >/dev/null 2>&1; then python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+  else printf '%s' "$1" | sed -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g' -e 's/:/%3A/g'; fi
 }
-
-CERT_PIN=""; CERT_PIN_ENC=""; CERT_FPR=""; CERT_DATES=""
+CERT_PIN=""; CERT_PIN_ENC=""; CERT_FPR=""
 if [ -f /etc/hysteria/cert.crt ]; then
-  if openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null > /tmp/pin.tmp; then
-    CERT_PIN=$(cat /tmp/pin.tmp | tr -d '\n')
-  else
-    CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null | tr -d '\n')
-  fi
-  rm -f /tmp/pin.tmp
-  CERT_PIN_ENC=$(urlencode "$CERT_PIN")
+  if openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null > /tmp/pin.tmp; then CERT_PIN=$(cat /tmp/pin.tmp | tr -d '\n')
+  else CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null | tr -d '\n'); fi
+  rm -f /tmp/pin.tmp; CERT_PIN_ENC=$(urlencode "$CERT_PIN")
   CERT_FPR=$(openssl x509 -in /etc/hysteria/cert.crt -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
-  CERT_DATES=$(openssl x509 -in /etc/hysteria/cert.crt -noout -dates 2>/dev/null | tr '\n' ' ')
 fi
-
 cp /etc/hysteria/cert.crt /root/hy2-cert.crt 2>/dev/null || true
 cp /etc/hysteria/cert.crt /etc/hysteria/client.crt 2>/dev/null || true
 chmod 644 /root/hy2-cert.crt 2>/dev/null || true
@@ -248,23 +299,17 @@ socks5:
 http:
   listen: 127.0.0.1:8080
 EOF
-
 cat > /root/hy2-clash.yaml <<EOF
-# Karing / Clash.Meta / Mihomo 专用 - 直接导入
 proxies:
     - name: Hy2-${SERVER_IP}
-    type: hysteria2
-    server: ${SERVER_IP}
-    port: ${HY_PORT}
-    password: ${HY_PASS}
-    sni: bing.com
-    skip-cert-verify: false
-    pinSHA256: ${CERT_PIN}
-    # 如果上面在你的Karing版本报错，注释掉上面两行，启用下面两行
-    # skip-cert-verify: true
-    # fingerprint: chrome
+      type: hysteria2
+      server: ${SERVER_IP}
+      port: ${HY_PORT}
+      password: ${HY_PASS}
+      sni: bing.com
+      skip-cert-verify: false
+      pinSHA256: ${CERT_PIN}
 EOF
-
 cat > /root/hy2-singbox.json <<EOF
 {
   "type": "hysteria2",
@@ -272,44 +317,27 @@ cat > /root/hy2-singbox.json <<EOF
   "server": "${SERVER_IP}",
   "server_port": ${HY_PORT},
   "password": "${HY_PASS}",
-  "tls": {
-    "enabled": true,
-    "server_name": "bing.com",
-    "pinSHA256": "${CERT_PIN}",
-    "insecure": false,
-    "alpn": "h3"
-  }
+  "tls": { "enabled": true, "server_name": "bing.com", "pinSHA256": "${CERT_PIN}", "insecure": false, "alpn": "h3" }
 }
 EOF
 
 echo ""
-echo -e "${GREEN}========== Alpine V1.2 完成 (Karing修复版) ==========${PLAIN}"
-echo -e "端口: ${CYAN}${HY_PORT}${PLAIN} | 密码: ${CYAN}${HY_PASS}${PLAIN} | IP: ${CYAN}${SERVER_IP}${PLAIN}"
-echo -e "证书指纹: ${CYAN}${CERT_FPR}${PLAIN}"
-echo -e "pin原始: ${CYAN}${CERT_PIN}${PLAIN}"
-echo -e "pin编码: ${CYAN}${CERT_PIN_ENC}${PLAIN}"
+echo -e "${GREEN}========== Universal V2.0 完成 [${FINAL_OS}] ==========${PLAIN}"
+echo -e "系统: ${CYAN}${FINAL_OS}${PLAIN} | 端口: ${CYAN}${HY_PORT}${PLAIN} | 密码: ${CYAN}${HY_PASS}${PLAIN} | IP: ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e "指纹: ${CYAN}${CERT_FPR}${PLAIN}"
+echo -e "pin: ${CYAN}${CERT_PIN}${PLAIN}"
 echo -e ""
-echo -e "${GREEN}--- [Karing/Clash专用-推荐] 分享链接 (URL编码后) ---${PLAIN}"
+echo -e "${GREEN}--- [Karing/Clash专用] ---${PLAIN}"
 echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${CERT_PIN_ENC}#Hy2-Karing-Pin${PLAIN}"
 echo -e ""
-echo -e "${YELLOW}--- [Karing兼容-带insecure] 如果上面还不行用这个 ---${PLAIN}"
+echo -e "${YELLOW}--- [兼容 insecure] ---${PLAIN}"
 echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1&pinSHA256=${CERT_PIN_ENC}#Hy2-Karing-InsecurePin${PLAIN}"
-echo -e ""
-echo -e "${YELLOW}--- [通用兼容] 分享链接 (insecure) ---${PLAIN}"
 echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Hy2-Insecure${PLAIN}"
 echo -e ""
-echo -e "${CYAN}--- Clash YAML (Karing最稳) 路径: /root/hy2-clash.yaml ---${PLAIN}"
-cat /root/hy2-clash.yaml
-echo -e ""
-echo -e "${CYAN}--- 证书内容 ---${PLAIN}"
-cat /etc/hysteria/cert.crt
-echo -e ""
-echo -e "管理命令:"
-echo -e "  日志: tail -f /var/log/hysteria.log"
-echo -e "  重启: rc-service hysteria restart  或  /usr/local/bin/hy2-restart.sh"
-echo -e "  开机自启: rc-update add hysteria default"
-echo -e "  客户端: cat /root/hy2-client.yaml"
-echo -e "  Clash: cat /root/hy2-clash.yaml"
-echo -e "  JSON: cat /root/hy2-singbox.json"
-echo -e "  证书: cat /root/hy2-cert.crt"
-echo -e "  放行: UDP ${HY_PORT}"
+if [ "$FINAL_OS" = "debian" ]; then
+  echo -e "管理: systemctl restart hysteria | journalctl -u hysteria -f | cat /root/hy2-clash.yaml"
+else
+  echo -e "管理: rc-service hysteria restart | tail -f /var/log/hysteria.log | cat /root/hy2-clash.yaml"
+fi
+echo -e "通用重启: /usr/local/bin/hy2-restart.sh"
+echo -e "放行: UDP ${HY_PORT}"
