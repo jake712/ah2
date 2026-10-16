@@ -1,9 +1,10 @@
 #!/bin/bash
-# Hysteria2 V3.7.3 完全修正版 - 2025-11-15
+# Hysteria2 V3.7.4 完全修正版 - Alpine/Debian通用
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 
 CUSTOM_PORT=""; CUSTOM_PASSWORD=""; CUSTOM_IP=""; CUSTOM_OS="auto"; NO_OBFS=""
+
 while getopts "p:w:i:o:nh" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
@@ -42,7 +43,7 @@ if [ "$FINAL_OS" = "unknown" ]; then
   FINAL_OS="debian"
 fi
 
-echo -e "${GREEN}=== Hysteria2 V3.7.3 完全修正版 [${FINAL_OS}] ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 V3.7.4 完全修正版 [${FINAL_OS}] ===${PLAIN}"
 
 if [ "$FINAL_OS" = "alpine" ]; then
   apk update
@@ -128,7 +129,7 @@ tls:
 EOF
 fi
 
-# === 保活1：keepalive ===
+# 保活脚本 - 用占位符避免转义出错
 cat > /usr/local/bin/hy2-keepalive.sh <<'KEEP'
 #!/bin/sh
 BIN="/usr/local/bin/hysteria"
@@ -210,7 +211,7 @@ chmod +x /usr/local/bin/hy2
 if [ -d /run/systemd/system ]; then
   cat > /etc/systemd/system/hysteria.service <<SERVICE
 [Unit]
-Description=Hysteria2 V3.7.3
+Description=Hysteria2 V3.7.4
 After=network.target network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -342,23 +343,21 @@ else
 fi
 
 cat > /root/hy2-info.txt <<EOF
-========== Hysteria2 V3.7.3 完全修正版 ==========
+========== Hysteria2 V3.7.4 完全修正版 ==========
 IP: ${SERVER_IP}
 端口: ${HY_PORT} (UDP)
 密码: ${HY_PASS}
 Obfs: ${OBFS_PASS}
 pinSHA256: ${CERT_PIN}
 
---- 推荐 Karing/Clash ---
+--- 推荐 ---
 ${SHARE1}
-
 --- 兼容 ---
 ${SHARE2}
 
 文件: /root/hy2-clash.yaml /root/hy2-client.yaml /root/hy2-cert.crt
 管理: hy2 status | hy2 log | hy2 restart
 保活: systemd双服务 + 15秒死循环 + 1分钟cron
-重要: 云服务器控制台安全组必须放行 UDP ${HY_PORT}
 EOF
 
 sleep 2
@@ -367,6 +366,6 @@ echo -e "${GREEN}========== 安装完成 ==========${PLAIN}"
 cat /root/hy2-info.txt
 echo ""
 echo "--- 自检 ---"
-ss -ulnp | grep -E "${HY_PORT}|hysteria" || echo -e "${RED}端口未监听! 请看 hy2 log${PLAIN}"
+ss -ulnp | grep -E "${HY_PORT}|hysteria" || echo -e "${RED}端口未监听! hy2 log${PLAIN}"
 ps aux | grep -v grep | grep hysteria || echo -e "${RED}进程未运行!${PLAIN}"
 if [ -d /run/systemd/system ]; then systemctl is-active hysteria hysteria-keepalive; fi
