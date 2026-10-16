@@ -1,339 +1,307 @@
-#!/bin/bash
-# Hysteria2 V3.7.2 完全修正版 - 保活加强 Debian/Ubuntu/Alpine通用
-set -e
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
+#!/bin/sh
+# Hysteria 2 Alpine V3.7 - NAT/Podman/LXC 低内存兼容 + IP检测修复版
+# 基于 jake712 V3.6 fix
+# 修复: V3.6 dig 语法反了导致出口IP永远拿不到 + curl ipv6超时
 
-CUSTOM_PORT=""; CUSTOM_PASSWORD=""; CUSTOM_IP=""; CUSTOM_OS="auto"; NO_OBFS=""
-while getopts "p:w:i:o:nh" opt; do
+set -e
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
+
+while getopts "p:w:i:h" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    o) CUSTOM_OS=$OPTARG ;;
-    n) NO_OBFS="1" ;;
-    h) echo "用法: $0 [-o debian|alpine|auto] [-p 端口] [-w 密码] [-i IP] [-n 不使用obfs]"; exit 0 ;;
+    h) echo "用法: $0 [-p 端口] [-w 密码] [-i 公网IP]"; exit 0 ;;
   esac
 done
 
-if [ "$(id -u)"!= "0" ]; then
-  echo -e "${RED}请用 root 运行${PLAIN}"
+if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
+
+echo -e "${GREEN}=== Hysteria2 Alpine V3.7 低内存/Podman修复版 ===${PLAIN}"
+echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date)"
+
+# ===== [1/6] 基础依赖 - 低内存优化 =====
+echo -e "${YELLOW}[1/6] 检查依赖 (低内存模式)...${PLAIN}"
+echo -e "当前 resolv.conf:"
+cat /etc/resolv.conf | head -n 5
+cat /proc/meminfo 2>/dev/null | grep -E "MemTotal|MemAvailable" || free -m 2>/dev/null || true
+
+if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
+  echo -e "${YELLOW}检测到 Podman (dns.podman)，保留原有 DNS${PLAIN}"
+else
+  if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
+    echo -e "${YELLOW}修复 DNS...${PLAIN}"
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  fi
+fi
+
+ensure_cmd() {
+  CMD=$1
+  PKG=$2
+  if ! command -v "$CMD" >/dev/null 2>&1; then
+    echo -e "${YELLOW}安装缺失: $CMD ($PKG)...${PLAIN}"
+    apk add --no-cache --no-interactive -q "$PKG" 2>&1 || apk add --no-cache "$PKG" 2>&1 || echo -e "${RED}安装 $PKG 失败，尝试继续...${PLAIN}"
+  else
+    echo -e "已存在: $CMD"
+  fi
+}
+
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  apk add --no-cache --no-interactive -q curl 2>&1 || apk add --no-cache curl 2>&1 || true
+fi
+
+ensure_cmd openssl openssl
+ensure_cmd dig bind-tools
+if ! command -v ss >/dev/null 2>&1; then
+  apk add --no-cache --no-interactive -q iproute2 2>&1 || true
+fi
+if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
+  ensure_cmd update-ca-certificates ca-certificates
+  update-ca-certificates 2>/dev/null || true
+fi
+
+# ===== [2/6] 参数和路径 =====
+echo -e "${YELLOW}[2/6] 初始化参数...${PLAIN}"
+HY_PORT=${CUSTOM_PORT:-26169}
+if [ -n "$CUSTOM_PASSWORD" ]; then
+  HY_PASS=$CUSTOM_PASSWORD
+else
+  if command -v openssl >/dev/null 2>&1; then
+    HY_PASS=$(openssl rand -base64 12 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 16)
+  else
+    HY_PASS=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 16)
+  fi
+fi
+[ -z "$HY_PASS" ] && HY_PASS="Hy2$(date +%s | tail -c 8)"
+
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) HY_ARCH="amd64" ;;
+  aarch64|arm64) HY_ARCH="arm64" ;;
+  armv7l|arm) HY_ARCH="arm" ;;
+  *) HY_ARCH="amd64" ;;
+esac
+
+mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log
+chmod 700 /etc/hysteria 2>/dev/null || true
+
+# ===== [3/6] 下载 Hysteria2 =====
+echo -e "${YELLOW}[3/6] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
+HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
+rm -f /tmp/hysteria
+download_ok=0
+for i in 1 2 3; do
+  echo "尝试下载 $HY_URL (第 $i 次)"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL"; then download_ok=1; break; fi
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    if wget -q --timeout=30 -O /tmp/hysteria "$HY_URL"; then download_ok=1; break; fi
+  fi
+  sleep 1
+done
+
+if [ "$download_ok" != "1" ] || [ ! -s /tmp/hysteria ]; then
+  echo -e "${RED}下载失败，尝试备用镜像...${PLAIN}"
+  for mirror in "https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}" "https://ghproxy.net/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"; do
+    echo "尝试镜像 $mirror"
+    curl -4fsSL --max-time 30 -o /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
+    wget -q --timeout=30 -O /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
+  done
+fi
+
+if [ ! -s /tmp/hysteria ] || head -c 200 /tmp/hysteria 2>/dev/null | grep -qi "<html"; then
+  echo -e "${RED}下载失败，请手动下载:${PLAIN}"
+  echo -e "wget -O /usr/local/bin/hysteria $HY_URL"
   exit 1
 fi
 
-detect_os(){
-  local T="unknown"
-  if [ -f /etc/os-release ]; then
-   . /etc/os-release
-    case "$ID" in alpine) T="alpine";; debian|ubuntu) T="debian";; esac
-    case "$ID_LIKE" in *debian*|*ubuntu*) T="debian";; *alpine*) T="alpine";; esac
-  fi
-  if [ "$T" = "unknown" ]; then
-    command -v apk >/dev/null 2>&1 && T="alpine"
-    command -v apt-get >/dev/null 2>&1 && T="debian"
-  fi
-  echo "$T"
-}
+mv /tmp/hysteria /usr/local/bin/hysteria
+chmod +x /usr/local/bin/hysteria
+/usr/local/bin/hysteria version 2>&1 || /usr/local/bin/hysteria -v 2>&1 || echo "二进制已就绪"
 
-FINAL_OS=$(detect_os)
-if [ "$CUSTOM_OS"!= "auto" ]; then FINAL_OS=$CUSTOM_OS; fi
-if [ "$FINAL_OS" = "unknown" ]; then FINAL_OS="debian"; fi
-
-echo -e "${GREEN}=== Hysteria2 V3.7.2 完全修正版 [${FINAL_OS}] ===${PLAIN}"
-
-if [ "$FINAL_OS" = "alpine" ]; then
-  apk update
-  apk add --no-cache curl wget openssl bind-tools iproute2 procps ca-certificates python3 iptables dcron util-linux
-  rc-update add dcron default 2>/dev/null || true; rc-service dcron start 2>/dev/null || true
-else
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y curl wget openssl bind9-dnsutils iproute2 procps ca-certificates python3 cron iptables util-linux 2>/dev/null || apt-get install -y curl wget openssl procps ca-certificates python3 cron util-linux
-  systemctl enable cron 2>/dev/null || true; systemctl start cron 2>/dev/null || true
-fi
-
-HY_PORT=${CUSTOM_PORT:-443}
-HY_PASS=${CUSTOM_PASSWORD:-$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)}
-if [ -z "$HY_PASS" ]; then HY_PASS="Hy2$(date +%s | tail -c 6)"; fi
-OBFS_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
-
-ARCH=$(uname -m)
-case "$ARCH" in x86_64|amd64) HY_ARCH="amd64";; aarch64|arm64) HY_ARCH="arm64";; *) HY_ARCH="amd64";; esac
-
-mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log; chmod 700 /etc/hysteria
-
-HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
-rm -f /tmp/hysteria
-curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL" || wget -q -O /tmp/hysteria "$HY_URL" || true
-if [! -s /tmp/hysteria ]; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
-mv /tmp/hysteria /usr/local/bin/hysteria; chmod +x /usr/local/bin/hysteria
-echo -e "${GREEN}hysteria版本: $(/usr/local/bin/hysteria version 2>/dev/null || echo unknown)${PLAIN}"
-
-if [! -f /etc/hysteria/cert.crt ] || [! -f /etc/hysteria/key.key ]; then
+# ===== [4/6] 生成证书和配置 =====
+echo -e "${YELLOW}[4/6] 生成配置...${PLAIN}"
+if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
-  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || openssl genrsa -out /etc/hysteria/key.key 2048
-  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650
+  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || \
+  openssl genpkey -algorithm EC -pkeyopt ec_param_enc:named_curve -pkeyopt ec_paramgen_curve:P-256 -out /etc/hysteria/key.key 2>/dev/null || \
+  openssl genrsa -out /etc/hysteria/key.key 2048 2>/dev/null
+  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650 2>/dev/null || \
+  openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650
   chmod 600 /etc/hysteria/key.key
 fi
 
-if [ "$NO_OBFS" = "1" ]; then
-  cat > /etc/hysteria/config.yaml <<EOF
-listen: 0.0.0.0:${HY_PORT}
+cat > /etc/hysteria/config.yaml <<EOF
+listen: :${HY_PORT}
+
 auth:
   type: password
   password: ${HY_PASS}
+
 masquerade:
   type: proxy
   proxy:
     url: https://bing.com
     rewriteHost: true
+
 tls:
   cert: /etc/hysteria/cert.crt
   key: /etc/hysteria/key.key
 EOF
-else
-  cat > /etc/hysteria/config.yaml <<EOF
-listen: 0.0.0.0:${HY_PORT}
-auth:
-  type: password
-  password: ${HY_PASS}
-obfs:
-  type: salamander
-  salamander:
-    password: ${OBFS_PASS}
-masquerade:
-  type: proxy
-  proxy:
-    url: https://bing.com
-    rewriteHost: true
-tls:
-  cert: /etc/hysteria/cert.crt
-  key: /etc/hysteria/key.key
-EOF
-fi
 
-# 保活脚本1 - 端口+进程双检测
-cat > /usr/local/bin/hy2-keepalive.sh <<KEEP
-#!/bin/sh
-BIN="/usr/local/bin/hysteria"
-CONF="/etc/hysteria/config.yaml"
-LOG="/var/log/hysteria.log"
-PORT="${HY_PORT}"
-LOCK="/run/hysteria/keepalive.lock"
-mkdir -p /run/hysteria
-exec 200>\$LOCK
-flock -n 200 || exit 0
+cat /etc/hysteria/config.yaml
 
-if [ -f "\$LOG" ]; then
-  S=\$(wc -c < "\$LOG" 2>/dev/null || echo 0)
-  [ "\$S" -gt 52428800 ] && : > "\$LOG"
-fi
-
-NEED_RESTART=0
-REASON=""
-if! pgrep -f "hysteria.*config.yaml" >/dev/null 2>&1; then
-  NEED_RESTART=1
-  REASON="process_not_found"
-else
-  if! ss -uln 2>/dev/null | grep -q ":\$PORT "; then
-    NEED_RESTART=1
-    REASON="port_not_listening"
-  fi
-fi
-if [! -x "\$BIN" ]; then NEED_RESTART=1; REASON="binary_missing"; fi
-if [! -f "\$CONF" ]; then NEED_RESTART=1; REASON="conf_missing"; fi
-
-if [ "\$NEED_RESTART" = "1" ]; then
-  echo "\$(date '+%F %T') [keepalive] restart reason=\$REASON" >> "\$LOG"
-  pkill -9 -f "hysteria.*config.yaml" 2>/dev/null || true
-  sleep 1
-  iptables -C INPUT -p udp --dport \$PORT -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport \$PORT -j ACCEPT 2>/dev/null || true
-  if [ -d /run/systemd/system ]; then
-    systemctl restart hysteria 2>/dev/null || nohup setsid \$BIN server -c \$CONF >> "\$LOG" 2>&1 &
-  else
-    nohup setsid \$BIN server -c \$CONF >> "\$LOG" 2>&1 &
-  fi
-fi
-KEEP
-chmod +x /usr/local/bin/hy2-keepalive.sh
-
-cat > /usr/local/bin/hy2-monitor.sh <<MON
-#!/bin/sh
-while true; do
-  /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1
-  sleep 15
-done
-MON
-chmod +x /usr/local/bin/hy2-monitor.sh
-
-cat > /usr/local/bin/hy2 <<'MGR'
-#!/bin/bash
-LOG="/var/log/hysteria.log"
-case "$1" in
-  status) systemctl status hysteria hysteria-keepalive --no-pager -l 2>/dev/null || pgrep -a hysteria; echo "---PORT---"; ss -ulnp 2>/dev/null | grep hysteria; echo "---CRON---"; crontab -l 2>/dev/null | grep hy2 ;;
-  log) tail -n 200 -f "$LOG" ;;
-  restart) pkill -9 -f "hysteria.*config.yaml"; sleep 1; /usr/local/bin/hy2-keepalive.sh; systemctl restart hysteria hysteria-keepalive 2>/dev/null || true; echo "已重启"; sleep 1; ss -ulnp | grep hysteria ;;
-  stop) systemctl stop hysteria hysteria-keepalive 2>/dev/null; pkill -9 -f "hysteria.*config.yaml"; echo "已停止" ;;
-  info) cat /root/hy2-info.txt ;;
-  url) grep hysteria2 /root/hy2-info.txt ;;
-  uninstall) read -p "确定卸载 y/n: " c; [ "$c" = "y" ] || exit 0; systemctl stop hysteria hysteria-keepalive 2>/dev/null; systemctl disable hysteria hysteria-keepalive 2>/dev/null; rm -f /etc/systemd/system/hysteria.service /etc/systemd/system/hysteria-keepalive.service; systemctl daemon-reload 2>/dev/null; pkill -9 -f hysteria; crontab -l 2>/dev/null | grep -v hy2 | crontab -; rm -rf /etc/hysteria /usr/local/bin/hysteria /usr/local/bin/hy2-keepalive.sh /usr/local/bin/hy2-monitor.sh /var/log/hysteria.log /root/hy2-*; rm -f /usr/local/bin/hy2; echo "已卸载" ;;
-  *) echo "hy2 {status|log|restart|stop|info|url|uninstall}" ;;
-esac
-MGR
-chmod +x /usr/local/bin/hy2
-
-if [ -d /run/systemd/system ]; then
-  cat > /etc/systemd/system/hysteria.service <<SERVICE
-[Unit]
-Description=Hysteria2 V3.7.2
-After=network.target network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-[Service]
-Type=simple
-ExecStartPre=/bin/mkdir -p /run/hysteria
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
-Restart=always
-RestartSec=2
-RestartSteps=10
-RestartMaxDelaySec=60
-StartLimitBurst=0
-LimitNOFILE=1048576
-OOMScoreAdjust=-999
-KillMode=mixed
-TimeoutStopSec=5
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-  cat > /etc/systemd/system/hysteria-keepalive.service <<SERVICE2
-[Unit]
-Description=Hysteria2 Keepalive Monitor
-After=hysteria.service
-StartLimitIntervalSec=0
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hy2-monitor.sh
-Restart=always
-RestartSec=5
-OOMScoreAdjust=-999
-[Install]
-WantedBy=multi-user.target
-SERVICE2
-
-  systemctl daemon-reload
-  systemctl enable hysteria hysteria-keepalive
-  systemctl restart hysteria hysteria-keepalive
-else
-  cat > /etc/init.d/hysteria <<'INIT'
+# ===== [5/6] 服务 - 兼容 Podman =====
+echo -e "${YELLOW}[5/6] 配置服务...${PLAIN}"
+if [ -f /sbin/openrc-run ] || command -v rc-update >/dev/null 2>&1; then
+  cat > /etc/init.d/hysteria <<'EOS'
 #!/sbin/openrc-run
 name="hysteria"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml"
-command_background=true
-pidfile="/run/hysteria/hysteria.pid"
+command_background="yes"
+pidfile="/run/hysteria/${RC_SVCNAME}.pid"
 output_log="/var/log/hysteria.log"
 error_log="/var/log/hysteria.log"
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn-delay 2 --respawn-max 0"
-depend() { need net; }
-start_pre() { checkpath --directory --mode 0755 /run/hysteria; }
-INIT
-  cat > /etc/init.d/hysteria-keepalive <<'INIT2'
-#!/sbin/openrc-run
-name="hysteria-keepalive"
-command="/usr/local/bin/hy2-monitor.sh"
-command_background=true
-pidfile="/run/hysteria/keepalive.pid"
-output_log="/var/log/hysteria.log"
-error_log="/var/log/hysteria.log"
-supervisor=supervise-daemon
-depend() { need net; after hysteria; }
-start_pre() { checkpath --directory --mode 0755 /run/hysteria; }
-INIT2
-  chmod +x /etc/init.d/hysteria /etc/init.d/hysteria-keepalive
-  rc-update add hysteria default 2>/dev/null; rc-update add hysteria-keepalive default 2>/dev/null
-  rc-service hysteria restart || rc-service hysteria start
-  rc-service hysteria-keepalive restart || rc-service hysteria-keepalive start || nohup /usr/local/bin/hy2-monitor.sh >/dev/null 2>&1 &
-fi
-
-(crontab -l 2>/dev/null | grep -v hy2 | grep -v hysteria || true; echo "*/1 * * * * /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1"; echo "@reboot sleep 10 && /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1"; echo "@reboot sleep 15 && nohup /usr/local/bin/hy2-monitor.sh >/dev/null 2>&1 &") | crontab -
-
-if command -v ufw >/dev/null 2>&1; then ufw allow ${HY_PORT}/udp 2>/dev/null || true; fi
-if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-port=${HY_PORT}/udp 2>/dev/null; firewall-cmd --reload 2>/dev/null || true; fi
-iptables -C INPUT -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || true
-
-if [ -n "$CUSTOM_IP" ]; then SERVER_IP=$CUSTOM_IP; else SERVER_IP=$(curl -4fsSL --max-time 4 https://api4.ipify.org 2>/dev/null || curl -4fsSL https://ifconfig.me 2>/dev/null || echo "YOUR_IP"); fi
-
-urlencode(){ python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1" 2>/dev/null || echo "$1"; }
-CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64 | tr -d '\n')
-if [ -z "$CERT_PIN" ]; then CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout | openssl rsa -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64 | tr -d '\n'); fi
-PIN_ENC=$(urlencode "$CERT_PIN"); OBFS_ENC=$(urlencode "$OBFS_PASS")
-cp /etc/hysteria/cert.crt /root/hy2-cert.crt 2>/dev/null || true
-
-cat > /root/hy2-client.yaml <<EOF
-server: ${SERVER_IP}:${HY_PORT}
-auth: ${HY_PASS}
-$(if [ "$NO_OBFS"!= "1" ]; then echo "obfs:
-  type: salamander
-  salamander:
-    password: ${OBFS_PASS}"; fi)
-tls:
-  sni: bing.com
-  pinSHA256: ${CERT_PIN}
-socks5:
-  listen: 127.0.0.1:1080
-http:
-  listen: 127.0.0.1:8080
-EOF
-
-cat > /root/hy2-clash.yaml <<EOF
-proxies:
-    - name: Hy2-${SERVER_IP}
-    type: hysteria2
-    server: ${SERVER_IP}
-    port: ${HY_PORT}
-    password: ${HY_PASS}
-$(if [ "$NO_OBFS"!= "1" ]; then echo " obfs: salamander
-    obfs-password: ${OBFS_PASS}"; fi)
-    sni: bing.com
-    pinSHA256: ${CERT_PIN}
-EOF
-
-if [ "$NO_OBFS" = "1" ]; then
-  SHARE1="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${PIN_ENC}#Hy2-Pin"
-  SHARE2="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Hy2-Insecure"
+depend() { need net; after firewall; }
+start_pre() {
+  checkpath --directory --mode 0755 /run/hysteria
+  checkpath --directory --mode 0755 /etc/hysteria
+}
+EOS
+  chmod +x /etc/init.d/hysteria
+  rc-update add hysteria default >/dev/null 2>&1 || true
+  rc-service hysteria restart 2>&1 || rc-service hysteria start 2>&1 || true
+  sleep 2
 else
-  SHARE1="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&obfs=salamander&obfs-password=${OBFS_ENC}&pinSHA256=${PIN_ENC}#Hy2-Pin-Obfs"
-  SHARE2="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&obfs=salamander&obfs-password=${OBFS_ENC}&insecure=1#Hy2-Obfs"
+  echo -e "${YELLOW}未检测到 OpenRC，使用 nohup 后台运行...${PLAIN}"
+  pkill -f "hysteria.*config.yaml" 2>/dev/null || true
+  sleep 1
+  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+  sleep 2
+  cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
+#!/bin/sh
+pkill -f "hysteria.*config.yaml" || true
+sleep 1
+nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+echo "已重启，日志: tail -f /var/log/hysteria.log"
+RESTART
+  chmod +x /usr/local/bin/hy2-restart.sh
 fi
 
-cat > /root/hy2-info.txt <<EOF
-========== Hysteria2 V3.7.2 完全修正版 ==========
-IP: ${SERVER_IP}
-端口: ${HY_PORT} (UDP)
-密码: ${HY_PASS}
-Obfs: ${OBFS_PASS}
-pinSHA256: ${CERT_PIN}
+sleep 1
+if command -v ss >/dev/null 2>&1; then
+  ss -tulpn 2>/dev/null | grep -E "$HY_PORT|hysteria" || true
+fi
+tail -n 20 /var/log/hysteria.log 2>/dev/null || true
 
---- 推荐 Karing/Clash ---
-${SHARE1}
+# ===== [6/6] IP检测 V3.7 修复版 =====
+echo -e "${YELLOW}[6/6] IP检测 V3.7 修复...${PLAIN}"
 
---- 兼容 ---
-${SHARE2}
+is_private_ip() {
+  local ip=$1
+  [ -z "$ip" ] && return 0
+  case "$ip" in
+    0.0.0.0|10.*|192.168.*|127.*|169.254.*) return 0 ;;
+    172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*) return 0 ;;
+  esac
+  # 100.64.0.0/10 = 100.64-127.x.x
+  if echo "$ip" | grep -Eq '^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.'; then return 0; fi
+  return 1
+}
 
-文件: /root/hy2-clash.yaml /root/hy2-client.yaml /root/hy2-cert.crt
-管理: hy2 status | hy2 log | hy2 restart
-保活: systemd双服务 + 15秒死循环 + 1分钟cron
-排错: ss -ulnp | grep ${HY_PORT}
-重要: 云服务器控制台安全组必须放行 UDP ${HY_PORT}
-EOF
+get_ssh_ip() {
+  if [ -n "$SSH_CONNECTION" ]; then echo "$SSH_CONNECTION" | awk '{print $3}'; return; fi
+  if [ -d /proc ]; then
+    for f in /proc/[0-9]*/environ; do
+      [ -f "$f" ] || continue
+      ip=$(tr '\0' '\n' < "$f" 2>/dev/null | grep '^SSH_CONNECTION=' | cut -d= -f2 | awk '{print $3}' | tail -n1)
+      if echo "$ip" | grep -Eq '^[0-9.]+$' && [ -n "$ip" ]; then echo "$ip"; return; fi
+    done
+  fi
+  # 兼容 busybox ss 没有 -H
+  ss -tn 2>/dev/null | grep ':22' | awk '{print $4}' | cut -d: -f1 | grep -E '^[0-9.]+$' | grep -v '^127\.' | head -n1
+}
 
-sleep 2
+get_pub_ip() {
+  local ip
+  # Fix: @server 要在前面, 原来写反了
+  if command -v dig >/dev/null 2>&1; then
+    for ns in "208.67.222.222" "208.67.220.220" "8.8.8.8" "1.1.1.1"; do
+      ip=$(dig +short +time=2 +tries=1 @${ns} myip.opendns.com 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+      if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
+    done
+    ip=$(dig +short +time=2 +tries=1 @8.8.8.8 TXT o-o.myaddr.l.google.com 2>/dev/null | tr -d '"' | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+    if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
+  fi
+  # Fix: 加 -4 强制IPv4，防止Alpine走IPv6超时
+  if command -v curl >/dev/null 2>&1; then
+    for api in "https://api4.ipify.org" "https://ifconfig.me/ip" "https://ip.sb" "http://api.ipify.org" "https://icanhazip.com" "https://checkip.amazonaws.com"; do
+      ip=$(curl -4fsSL --max-time 4 "$api" 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+      if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
+    done
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    for api in "https://api4.ipify.org" "https://ifconfig.me" "http://icanhazip.com"; do
+      ip=$(wget -qO- --timeout=4 "$api" 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)
+      if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi
+    done
+  fi
+}
+
+if [ -n "$CUSTOM_IP" ]; then
+  SERVER_IP=$CUSTOM_IP
+  echo -e "${GREEN}手动指定 -i: $SERVER_IP${PLAIN}"
+else
+  SIP=$(get_ssh_ip)
+  PIP=$(get_pub_ip)
+  echo -e " SSH会话IP: ${YELLOW}${SIP:-未找到}${PLAIN}"
+  echo -e " 出口公网IP: ${YELLOW}${PIP:-未知}${PLAIN}"
+  echo -e " SSH_CONNECTION=${SSH_CONNECTION:-空}"
+
+  if [ -z "$SIP" ] && [ -n "$PIP" ]; then
+    SERVER_IP=$PIP
+    echo -e "${GREEN}>> 采用出口公网IP: $SERVER_IP${PLAIN}"
+  elif [ -z "$SIP" ] && [ -z "$PIP" ]; then
+    SERVER_IP=""
+    echo -e "${RED}>> 无法自动获取任何IP${PLAIN}"
+  elif is_private_ip "$SIP"; then
+    if [ -n "$PIP" ]; then
+      SERVER_IP=$PIP
+      echo -e "${YELLOW}>> SSH IP $SIP 是内网 (NAT/Podman)，切换到公网IP: $SERVER_IP${PLAIN}"
+    else
+      SERVER_IP=$SIP
+      echo -e "${RED}>> 内网IP $SIP，但出口IP获取失败，请用 -i 指定${PLAIN}"
+    fi
+  else
+    SERVER_IP=$SIP
+    echo -e "${GREEN}>> 采用公网IP: $SERVER_IP${PLAIN}"
+  fi
+fi
+
+if [ -z "$SERVER_IP" ]; then
+  echo -e ""
+  echo -e "${RED}========== 获取IP失败 ==========${PLAIN}"
+  echo -e "在 Podman/NAT 容器中，请在宿主机执行: curl -s https://api4.ipify.org"
+  echo -e "然后重新安装: bash $0 -p $HY_PORT -i 你的公网IP"
+  SERVER_IP="YOUR_PUBLIC_IP"
+fi
+
 echo ""
-echo -e "${GREEN}========== 安装完成 ==========${PLAIN}"
-cat /root/hy2-info.txt
-echo ""
-echo "--- 自检 ---"
-ss -ulnp | grep -E "${HY_PORT}|hysteria" || echo -e "${RED}端口未监听! 请看 hy2 log${PLAIN}"
-ps aux | grep -v grep | grep hysteria || echo -e "${RED}进程未运行!${PLAIN}"
-if [ -d /run/systemd/system ]; then systemctl is-active hysteria hysteria-keepalive; fi
+echo -e "${GREEN}========== V3.7 完成 ==========${PLAIN}"
+echo -e "端口: ${CYAN}${HY_PORT}${PLAIN}"
+echo -e "密码: ${CYAN}${HY_PASS}${PLAIN}"
+echo -e "IP: ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e ""
+echo -e "分享链接:"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Alpine-Hy2-V3.7-Podman${PLAIN}"
+echo -e ""
+echo -e "日志: tail -f /var/log/hysteria.log"
+echo -e "重启: /usr/local/bin/hy2-restart.sh 或 rc-service hysteria restart"
+echo -e "记得放行 UDP ${CYAN}${HY_PORT}${PLAIN}"
+if [ "$SERVER_IP" = "YOUR_PUBLIC_IP" ]; then
+  echo -e "${RED}注意: 请替换 YOUR_PUBLIC_IP 为真实公网IP${PLAIN}"
+fi
