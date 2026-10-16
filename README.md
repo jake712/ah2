@@ -4,6 +4,7 @@ Alpine 一鍵安裝Hysteria 2
 主機IP SSH的IP
 v2n core核心要改為sing_box
 
+精簡版小內存可用
 ```
 curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-Install-V2.sh | bash -s -- -p 端口 -i 主機IP
 ```
