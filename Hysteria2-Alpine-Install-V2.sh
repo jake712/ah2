@@ -1,6 +1,6 @@
 #!/bin/bash
-# Hysteria2 V3.6 完全版 - 修復不通版 - Debian/Ubuntu/Alpine 通用
-# 特點: 0.0.0.0監聽 / 去掉fastOpen / 保活 / obfs可選 / 自動防火牆
+# Hysteria2 V3.6 完全版 - 穩定保活修復版 - Debian/Ubuntu/Alpine 通用
+# 特點: 0.0.0.0監聽 / 去掉fastOpen / 智能保活 / obfs可選 / 自動防火牆
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 
@@ -77,7 +77,7 @@ if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   chmod 600 /etc/hysteria/key.key
 fi
 
-# 寫入最穩定的最小配置
+# 寫入設定檔
 if [ "$NO_OBFS" = "1" ]; then
   cat > /etc/hysteria/config.yaml <<EOF
 listen: 0.0.0.0:${HY_PORT}
@@ -114,12 +114,12 @@ tls:
 EOF
 fi
 
+# 備用保活腳本（僅供無 systemd 環境使用）
 cat > /usr/local/bin/hy2-keepalive.sh <<KEEP
 #!/bin/sh
 BIN="/usr/local/bin/hysteria"
 CONF="/etc/hysteria/config.yaml"
 LOG="/var/log/hysteria.log"
-PORT="${HY_PORT}"
 if [ -f "\$LOG" ]; then
   S=\$(wc -c < "\$LOG" 2>/dev/null || echo 0)
   [ "\$S" -gt 52428800 ] && : > "\$LOG"
@@ -132,28 +132,93 @@ fi
 KEEP
 chmod +x /usr/local/bin/hy2-keepalive.sh
 
+# 統一管理腳本
 cat > /usr/local/bin/hy2 <<'MGR'
 #!/bin/bash
 LOG="/var/log/hysteria.log"
 case "$1" in
-  status) systemctl status hysteria --no-pager -l 2>/dev/null || pgrep -a hysteria; ss -ulnp 2>/dev/null | grep hysteria; crontab -l 2>/dev/null | grep hy2 ;;
+  status) systemctl status hysteria --no-pager -l 2>/dev/null || pgrep -a hysteria; ss -ulnp 2>/dev/null | grep hysteria ;;
   log) tail -n 200 -f "$LOG" ;;
-  restart) pkill -f "hysteria.*config.yaml"; sleep 1; /usr/local/bin/hy2-keepalive.sh; systemctl restart hysteria 2>/dev/null || true; echo "已重启"; sleep 1; ss -ulnp | grep hysteria ;;
-  stop) pkill -f "hysteria.*config.yaml"; systemctl stop hysteria 2>/dev/null || true; echo "已停止" ;;
+  restart) 
+    if systemctl is-active hysteria >/dev/null 2>&1; then
+      systemctl restart hysteria
+    else
+      pkill -f "hysteria.*config.yaml"; sleep 1; /usr/local/bin/hy2-keepalive.sh
+    fi
+    echo "已执行重启"
+    sleep 1
+    ss -ulnp | grep hysteria 
+    ;;
+  stop) 
+    systemctl stop hysteria 2>/dev/null || true
+    pkill -f "hysteria.*config.yaml" 2>/dev/null || true
+    echo "已停止" 
+    ;;
   info) cat /root/hy2-info.txt ;;
   url) grep hysteria2 /root/hy2-info.txt ;;
-  uninstall) read -p "确定卸载 y/n: " c; [ "$c" = "y" ] || exit 0; systemctl stop hysteria 2>/dev/null; rm -f /etc/systemd/system/hysteria.service; systemctl daemon-reload 2>/dev/null; pkill -f hysteria; crontab -l 2>/dev/null | grep -v hy2-keepalive | crontab -; rm -rf /etc/hysteria /usr/local/bin/hysteria /usr/local/bin/hy2-keepalive.sh /var/log/hysteria.log /root/hy2-*; rm -f /usr/local/bin/hy2; echo "已卸载" ;;
+  uninstall) 
+    read -p "确定卸载 y/n: " c; [ "$c" = "y" ] || exit 0
+    systemctl stop hysteria 2>/dev/null
+    rm -f /etc/systemd/system/hysteria.service
+    systemctl daemon-reload 2>/dev/null
+    pkill -f hysteria
+    crontab -l 2>/dev/null | grep -v hy2-keepalive | crontab - 2>/dev/null || true
+    rm -rf /etc/hysteria /usr/local/bin/hysteria /usr/local/bin/hy2-keepalive.sh /var/log/hysteria.log /root/hy2-*
+    rm -f /usr/local/bin/hy2
+    echo "已卸载" 
+    ;;
+  *) echo "hy2 {status|log|restart|stop|info|url|uninstall}" ;;
+es:
+MGR
+# 修正上面 case 結尾拼寫錯誤 (esac)
+cat > /usr/local/bin/hy2 <<'MGR'
+#!/bin/bash
+LOG="/var/log/hysteria.log"
+case "$1" in
+  status) systemctl status hysteria --no-pager -l 2>/dev/null || pgrep -a hysteria; ss -ulnp 2>/dev/null | grep hysteria ;;
+  log) tail -n 200 -f "$LOG" ;;
+  restart) 
+    if systemctl is-active hysteria >/dev/null 2>&1; then
+      systemctl restart hysteria
+    else
+      pkill -f "hysteria.*config.yaml"; sleep 1; /usr/local/bin/hy2-keepalive.sh
+    fi
+    echo "已执行重启"
+    sleep 1
+    ss -ulnp | grep hysteria 
+    ;;
+  stop) 
+    systemctl stop hysteria 2>/dev/null || true
+    pkill -f "hysteria.*config.yaml" 2>/dev/null || true
+    echo "已停止" 
+    ;;
+  info) cat /root/hy2-info.txt ;;
+  url) grep hysteria2 /root/hy2-info.txt ;;
+  uninstall) 
+    read -p "确定卸载 y/n: " c; [ "$c" = "y" ] || exit 0
+    systemctl stop hysteria 2>/dev/null
+    rm -f /etc/systemd/system/hysteria.service
+    systemctl daemon-reload 2>/dev/null
+    pkill -f hysteria
+    crontab -l 2>/dev/null | grep -v hy2-keepalive | crontab - 2>/dev/null || true
+    rm -rf /etc/hysteria /usr/local/bin/hysteria /usr/local/bin/hy2-keepalive.sh /var/log/hysteria.log /root/hy2-*
+    rm -f /usr/local/bin/hy2
+    echo "已卸载" 
+    ;;
   *) echo "hy2 {status|log|restart|stop|info|url|uninstall}" ;;
 esac
 MGR
 chmod +x /usr/local/bin/hy2
 
+# 根據系統類型配置服務與保活策略
 if [ -d /run/systemd/system ]; then
+  # 擁有 systemd：完全由 systemd 負責保活，不寫入 crontab 定時器避免衝突
   cat > /etc/systemd/system/hysteria.service <<SERVICE
 [Unit]
 Description=Hysteria2 V3.6
 After=network.target network-online.target
 Wants=network-online.target
+
 [Service]
 Type=simple
 ExecStartPre=/bin/mkdir -p /run/hysteria
@@ -163,11 +228,15 @@ RestartSec=3
 StartLimitInterval=0
 StartLimitBurst=0
 LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
 SERVICE
-  systemctl daemon-reload; systemctl enable hysteria; systemctl restart hysteria
+  systemctl daemon-reload
+  systemctl enable hysteria
+  systemctl restart hysteria
 else
+  # 無 systemd 環境（如 Alpine）：使用 Cron 執行備用保活
   cat > /etc/init.d/hysteria <<'INIT'
 #!/sbin/openrc-run
 name="hysteria"
@@ -181,11 +250,15 @@ supervisor=supervise-daemon
 depend() { need net; }
 start_pre() { checkpath --directory --mode 0755 /run/hysteria; }
 INIT
-  chmod +x /etc/init.d/hysteria; rc-update add hysteria default 2>/dev/null; rc-service hysteria restart || rc-service hysteria start || /usr/local/bin/hy2-keepalive.sh
+  chmod +x /etc/init.d/hysteria
+  rc-update add hysteria default 2>/dev/null
+  rc-service hysteria restart || rc-service hysteria start || /usr/local/bin/hy2-keepalive.sh
+  
+  # 寫入 Cron 保活
+  (crontab -l 2>/dev/null | grep -v hy2-keepalive || true; echo "*/1 * * * * /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1"; echo "@reboot sleep 10 && /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1") | crontab -
 fi
 
-(crontab -l 2>/dev/null | grep -v hy2-keepalive || true; echo "*/1 * * * * /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1"; echo "@reboot sleep 10 && /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1") | crontab -
-
+# 防火牆設置
 if command -v ufw >/dev/null 2>&1; then ufw allow ${HY_PORT}/udp 2>/dev/null || true; fi
 if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-port=${HY_PORT}/udp 2>/dev/null; firewall-cmd --reload 2>/dev/null || true; fi
 iptables -C INPUT -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || true
@@ -253,7 +326,7 @@ ${SHARE2}
 管理: hy2 status | hy2 log | hy2 restart
 
 排错:
-  ss -ulnp | grep ${HY_PORT}  # 必须有LISTEN
+  ss -ulnp | grep ${HY_PORT}   # 必须有LISTEN
   hy2 log                      # 看日志
   重要: 云服务器控制台安全组必须放行 UDP ${HY_PORT}
 EOF
