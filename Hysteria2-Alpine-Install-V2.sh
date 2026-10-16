@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hysteria2 V3.7.2 完全修正版 - 保活加强 Debian/Ubuntu/Alpine通用
+# Hysteria2 V3.7.3 完全修正版 - 2025-11-15
 set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; PLAIN='\033[0m'
 
@@ -35,37 +35,54 @@ detect_os(){
 }
 
 FINAL_OS=$(detect_os)
-if [ "$CUSTOM_OS"!= "auto" ]; then FINAL_OS=$CUSTOM_OS; fi
-if [ "$FINAL_OS" = "unknown" ]; then FINAL_OS="debian"; fi
+if [ "$CUSTOM_OS"!= "auto" ]; then
+  FINAL_OS=$CUSTOM_OS
+fi
+if [ "$FINAL_OS" = "unknown" ]; then
+  FINAL_OS="debian"
+fi
 
-echo -e "${GREEN}=== Hysteria2 V3.7.2 完全修正版 [${FINAL_OS}] ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 V3.7.3 完全修正版 [${FINAL_OS}] ===${PLAIN}"
 
 if [ "$FINAL_OS" = "alpine" ]; then
   apk update
   apk add --no-cache curl wget openssl bind-tools iproute2 procps ca-certificates python3 iptables dcron util-linux
-  rc-update add dcron default 2>/dev/null || true; rc-service dcron start 2>/dev/null || true
+  rc-update add dcron default 2>/dev/null || true
+  rc-service dcron start 2>/dev/null || true
 else
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y curl wget openssl bind9-dnsutils iproute2 procps ca-certificates python3 cron iptables util-linux 2>/dev/null || apt-get install -y curl wget openssl procps ca-certificates python3 cron util-linux
-  systemctl enable cron 2>/dev/null || true; systemctl start cron 2>/dev/null || true
+  systemctl enable cron 2>/dev/null || true
+  systemctl start cron 2>/dev/null || true
 fi
 
 HY_PORT=${CUSTOM_PORT:-443}
 HY_PASS=${CUSTOM_PASSWORD:-$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)}
-if [ -z "$HY_PASS" ]; then HY_PASS="Hy2$(date +%s | tail -c 6)"; fi
+if [ -z "$HY_PASS" ]; then
+  HY_PASS="Hy2$(date +%s | tail -c 6)"
+fi
 OBFS_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
 
 ARCH=$(uname -m)
-case "$ARCH" in x86_64|amd64) HY_ARCH="amd64";; aarch64|arm64) HY_ARCH="arm64";; *) HY_ARCH="amd64";; esac
+case "$ARCH" in
+  x86_64|amd64) HY_ARCH="amd64" ;;
+  aarch64|arm64) HY_ARCH="arm64" ;;
+  *) HY_ARCH="amd64" ;;
+esac
 
-mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log; chmod 700 /etc/hysteria
+mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log
+chmod 700 /etc/hysteria
 
 HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
 rm -f /tmp/hysteria
 curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL" || wget -q -O /tmp/hysteria "$HY_URL" || true
-if [! -s /tmp/hysteria ]; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
-mv /tmp/hysteria /usr/local/bin/hysteria; chmod +x /usr/local/bin/hysteria
+if [! -s /tmp/hysteria ]; then
+  echo -e "${RED}下载失败${PLAIN}"
+  exit 1
+fi
+mv /tmp/hysteria /usr/local/bin/hysteria
+chmod +x /usr/local/bin/hysteria
 echo -e "${GREEN}hysteria版本: $(/usr/local/bin/hysteria version 2>/dev/null || echo unknown)${PLAIN}"
 
 if [! -f /etc/hysteria/cert.crt ] || [! -f /etc/hysteria/key.key ]; then
@@ -111,52 +128,61 @@ tls:
 EOF
 fi
 
-# 保活脚本1 - 端口+进程双检测
-cat > /usr/local/bin/hy2-keepalive.sh <<KEEP
+# === 保活1：keepalive ===
+cat > /usr/local/bin/hy2-keepalive.sh <<'KEEP'
 #!/bin/sh
 BIN="/usr/local/bin/hysteria"
 CONF="/etc/hysteria/config.yaml"
 LOG="/var/log/hysteria.log"
-PORT="${HY_PORT}"
+PORT="__HY_PORT__"
 LOCK="/run/hysteria/keepalive.lock"
 mkdir -p /run/hysteria
-exec 200>\$LOCK
+exec 200>"$LOCK"
 flock -n 200 || exit 0
 
-if [ -f "\$LOG" ]; then
-  S=\$(wc -c < "\$LOG" 2>/dev/null || echo 0)
-  [ "\$S" -gt 52428800 ] && : > "\$LOG"
+if [ -f "$LOG" ]; then
+  S=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+  if [ "$S" -gt 52428800 ]; then : > "$LOG"; fi
 fi
 
 NEED_RESTART=0
 REASON=""
+
 if! pgrep -f "hysteria.*config.yaml" >/dev/null 2>&1; then
   NEED_RESTART=1
   REASON="process_not_found"
 else
-  if! ss -uln 2>/dev/null | grep -q ":\$PORT "; then
+  if! ss -uln 2>/dev/null | grep -q ":$PORT "; then
     NEED_RESTART=1
     REASON="port_not_listening"
   fi
 fi
-if [! -x "\$BIN" ]; then NEED_RESTART=1; REASON="binary_missing"; fi
-if [! -f "\$CONF" ]; then NEED_RESTART=1; REASON="conf_missing"; fi
 
-if [ "\$NEED_RESTART" = "1" ]; then
-  echo "\$(date '+%F %T') [keepalive] restart reason=\$REASON" >> "\$LOG"
+if [! -x "$BIN" ]; then
+  NEED_RESTART=1
+  REASON="binary_missing"
+fi
+if [! -f "$CONF" ]; then
+  NEED_RESTART=1
+  REASON="conf_missing"
+fi
+
+if [ "$NEED_RESTART" = "1" ]; then
+  echo "$(date '+%F %T') [keepalive] restart reason=$REASON" >> "$LOG"
   pkill -9 -f "hysteria.*config.yaml" 2>/dev/null || true
   sleep 1
-  iptables -C INPUT -p udp --dport \$PORT -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport \$PORT -j ACCEPT 2>/dev/null || true
+  iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
   if [ -d /run/systemd/system ]; then
-    systemctl restart hysteria 2>/dev/null || nohup setsid \$BIN server -c \$CONF >> "\$LOG" 2>&1 &
+    systemctl restart hysteria 2>/dev/null || nohup setsid "$BIN" server -c "$CONF" >> "$LOG" 2>&1 &
   else
-    nohup setsid \$BIN server -c \$CONF >> "\$LOG" 2>&1 &
+    nohup setsid "$BIN" server -c "$CONF" >> "$LOG" 2>&1 &
   fi
 fi
 KEEP
+sed -i "s/__HY_PORT__/${HY_PORT}/g" /usr/local/bin/hy2-keepalive.sh
 chmod +x /usr/local/bin/hy2-keepalive.sh
 
-cat > /usr/local/bin/hy2-monitor.sh <<MON
+cat > /usr/local/bin/hy2-monitor.sh <<'MON'
 #!/bin/sh
 while true; do
   /usr/local/bin/hy2-keepalive.sh >/dev/null 2>&1
@@ -169,7 +195,7 @@ cat > /usr/local/bin/hy2 <<'MGR'
 #!/bin/bash
 LOG="/var/log/hysteria.log"
 case "$1" in
-  status) systemctl status hysteria hysteria-keepalive --no-pager -l 2>/dev/null || pgrep -a hysteria; echo "---PORT---"; ss -ulnp 2>/dev/null | grep hysteria; echo "---CRON---"; crontab -l 2>/dev/null | grep hy2 ;;
+  status) systemctl status hysteria hysteria-keepalive --no-pager -l 2>/dev/null || pgrep -a hysteria; ss -ulnp 2>/dev/null | grep hysteria; crontab -l 2>/dev/null | grep hy2 ;;
   log) tail -n 200 -f "$LOG" ;;
   restart) pkill -9 -f "hysteria.*config.yaml"; sleep 1; /usr/local/bin/hy2-keepalive.sh; systemctl restart hysteria hysteria-keepalive 2>/dev/null || true; echo "已重启"; sleep 1; ss -ulnp | grep hysteria ;;
   stop) systemctl stop hysteria hysteria-keepalive 2>/dev/null; pkill -9 -f "hysteria.*config.yaml"; echo "已停止" ;;
@@ -184,7 +210,7 @@ chmod +x /usr/local/bin/hy2
 if [ -d /run/systemd/system ]; then
   cat > /etc/systemd/system/hysteria.service <<SERVICE
 [Unit]
-Description=Hysteria2 V3.7.2
+Description=Hysteria2 V3.7.3
 After=network.target network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -251,7 +277,8 @@ depend() { need net; after hysteria; }
 start_pre() { checkpath --directory --mode 0755 /run/hysteria; }
 INIT2
   chmod +x /etc/init.d/hysteria /etc/init.d/hysteria-keepalive
-  rc-update add hysteria default 2>/dev/null; rc-update add hysteria-keepalive default 2>/dev/null
+  rc-update add hysteria default 2>/dev/null
+  rc-update add hysteria-keepalive default 2>/dev/null
   rc-service hysteria restart || rc-service hysteria start
   rc-service hysteria-keepalive restart || rc-service hysteria-keepalive start || nohup /usr/local/bin/hy2-monitor.sh >/dev/null 2>&1 &
 fi
@@ -262,12 +289,19 @@ if command -v ufw >/dev/null 2>&1; then ufw allow ${HY_PORT}/udp 2>/dev/null || 
 if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-port=${HY_PORT}/udp 2>/dev/null; firewall-cmd --reload 2>/dev/null || true; fi
 iptables -C INPUT -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport ${HY_PORT} -j ACCEPT 2>/dev/null || true
 
-if [ -n "$CUSTOM_IP" ]; then SERVER_IP=$CUSTOM_IP; else SERVER_IP=$(curl -4fsSL --max-time 4 https://api4.ipify.org 2>/dev/null || curl -4fsSL https://ifconfig.me 2>/dev/null || echo "YOUR_IP"); fi
+if [ -n "$CUSTOM_IP" ]; then
+  SERVER_IP=$CUSTOM_IP
+else
+  SERVER_IP=$(curl -4fsSL --max-time 4 https://api4.ipify.org 2>/dev/null || curl -4fsSL https://ifconfig.me 2>/dev/null || echo "YOUR_IP")
+fi
 
 urlencode(){ python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1" 2>/dev/null || echo "$1"; }
 CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64 | tr -d '\n')
-if [ -z "$CERT_PIN" ]; then CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout | openssl rsa -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64 | tr -d '\n'); fi
-PIN_ENC=$(urlencode "$CERT_PIN"); OBFS_ENC=$(urlencode "$OBFS_PASS")
+if [ -z "$CERT_PIN" ]; then
+  CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout | openssl rsa -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64 | tr -d '\n')
+fi
+PIN_ENC=$(urlencode "$CERT_PIN")
+OBFS_ENC=$(urlencode "$OBFS_PASS")
 cp /etc/hysteria/cert.crt /root/hy2-cert.crt 2>/dev/null || true
 
 cat > /root/hy2-client.yaml <<EOF
@@ -308,7 +342,7 @@ else
 fi
 
 cat > /root/hy2-info.txt <<EOF
-========== Hysteria2 V3.7.2 完全修正版 ==========
+========== Hysteria2 V3.7.3 完全修正版 ==========
 IP: ${SERVER_IP}
 端口: ${HY_PORT} (UDP)
 密码: ${HY_PASS}
@@ -324,7 +358,6 @@ ${SHARE2}
 文件: /root/hy2-clash.yaml /root/hy2-client.yaml /root/hy2-cert.crt
 管理: hy2 status | hy2 log | hy2 restart
 保活: systemd双服务 + 15秒死循环 + 1分钟cron
-排错: ss -ulnp | grep ${HY_PORT}
 重要: 云服务器控制台安全组必须放行 UDP ${HY_PORT}
 EOF
 
