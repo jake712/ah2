@@ -1,8 +1,7 @@
-#!/bin/bash
-
-# Hysteria 2 Debian V3.8-mod - -i 同时指定出入口IP
-# 基于 jake712 V3.7 Alpine版 改写为 Debian/Ubuntu 通用
-# 修改点: -i 参数同时作为出入口IP (bindIPv4 + 客户端显示IP)
+#!/bin/sh
+# Hysteria 2 Debian V1.2 - Podman/LXC/NAT + 证书pin + Karing修复完整版
+# 基于 V1.1 修改 - 修复 pinSHA256 URL编码导致 karing/clash.meta 无法导入问题
+# 适配: Debian 11/12/13, Ubuntu 20.04+, Podman无systemd容器
 
 set -e
 
@@ -13,108 +12,98 @@ while getopts "p:w:i:h" opt; do
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) echo "用法: $0 [-p 端口] [-w 密码] [-i 出入口IP]"; exit 0 ;;
+    h) echo "用法: $0 [-p 端口] [-w 密码] [-i 公网IP]"; exit 0 ;;
   esac
 done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Debian V3.8-mod 出入口同IP版 ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 Debian V1.2 Karing修复版 ===${PLAIN}"
+echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
 
-# ===== [1/6] 基础依赖 =====
-echo -e "${YELLOW}[1/6] 检查依赖...${PLAIN}"
-
+# ===== [1/7] 基础依赖 =====
+echo -e "${YELLOW}[1/7] 检查依赖 (Debian低内存模式)...${PLAIN}"
 export DEBIAN_FRONTEND=noninteractive
+cat /etc/resolv.conf | head -n 5
+cat /proc/meminfo 2>/dev/null | grep -E "MemTotal|MemAvailable" || free -m 2>/dev/null || true
 
 if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
-  echo -e "Podman DNS 保留"
+  echo -e "${YELLOW}检测到 Podman (dns.podman)，保留原有 DNS${PLAIN}"
 else
-  [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf && echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
-fi
-
-apt_update_done=0
-
-apt_install() {
-  if [ $apt_update_done -eq 0 ]; then
-    apt-get update -qq
-    apt_update_done=1
+  if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
   fi
-  apt-get install -y -qq "$@" || apt-get install -y "$@"
-}
+fi
 
+if ! command -v apt-get >/dev/null 2>&1; then echo -e "${RED}未检测到 apt-get${PLAIN}"; exit 1; fi
+
+APT_UPDATED=0
+apt_update() {
+  if [ $APT_UPDATED -eq 0 ]; then echo -e "${YELLOW}apt-get update...${PLAIN}"; apt-get update -qq; APT_UPDATED=1; fi
+}
 ensure_cmd() {
-  command -v "$1" >/dev/null 2>&1 && return 0
-  echo "安装缺失依赖: $2"
-  apt_install "$2"
+  CMD=$1; PKG=$2
+  if ! command -v "$CMD" >/dev/null 2>&1; then
+    echo -e "${YELLOW}安装缺失: $CMD ($PKG)...${PLAIN}"
+    apt_update; apt-get install -y --no-install-recommends "$PKG" 2>&1 || apt-get install -y "$PKG" 2>&1 || true
+  else echo -e "已存在: $CMD"; fi
 }
 
-# curl / wget 二选一
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-  apt_install curl wget
-fi
-
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then apt_update; apt-get install -y --no-install-recommends curl || true; fi
 ensure_cmd openssl openssl
+ensure_cmd dig dnsutils
+if ! command -v ss >/dev/null 2>&1; then apt_update; apt-get install -y --no-install-recommends iproute2 2>&1 || true; fi
+if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then apt_update; apt-get install -y --no-install-recommends ca-certificates 2>&1 || true; update-ca-certificates 2>/dev/null || true; fi
 
-# Debian 12+ dig 在 bind9-dnsutils, 旧版在 dnsutils
-if ! command -v dig >/dev/null 2>&1; then
-  apt_install dnsutils || apt_install bind9-dnsutils || apt_install bind9-host
-fi
-
-command -v ss >/dev/null 2>&1 || apt_install iproute2
-
-[ ! -f /etc/ssl/certs/ca-certificates.crt ] && apt_install ca-certificates && update-ca-certificates 2>/dev/null || true
-
-# ===== [2/6] 参数 =====
-echo -e "${YELLOW}[2/6] 初始化...${PLAIN}"
-
+# ===== [2/7] 参数 =====
+echo -e "${YELLOW}[2/7] 初始化参数...${PLAIN}"
 HY_PORT=${CUSTOM_PORT:-26169}
-
 if [ -n "$CUSTOM_PASSWORD" ]; then HY_PASS=$CUSTOM_PASSWORD
-else HY_PASS=$(openssl rand -base64 12 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 16); [ -z "$HY_PASS" ] && HY_PASS="Hy2$(date +%s | tail -c 8)"; fi
+else
+  if command -v openssl >/dev/null 2>&1; then HY_PASS=$(openssl rand -base64 12 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 16)
+  else HY_PASS=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 16); fi
+fi
+[ -z "$HY_PASS" ] && HY_PASS="Hy2$(date +%s | tail -c 8)"
 
-ARCH=$(uname -m); case "$ARCH" in x86_64|amd64) HY_ARCH="amd64";; aarch64|arm64) HY_ARCH="arm64";; arm*) HY_ARCH="arm";; *) HY_ARCH="amd64";; esac
+ARCH=$(uname -m)
+case "$ARCH" in x86_64|amd64) HY_ARCH="amd64";; aarch64|arm64) HY_ARCH="arm64";; armv7l|arm) HY_ARCH="arm";; *) HY_ARCH="amd64";; esac
+mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log
+chmod 700 /etc/hysteria 2>/dev/null || true
 
-mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log; chmod 700 /etc/hysteria 2>/dev/null || true
-
-# ===== [3/6] 下载 =====
-echo -e "${YELLOW}[3/6] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
-
+# ===== [3/7] 下载 =====
+echo -e "${YELLOW}[3/7] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
 HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
-
-rm -f /tmp/hysteria; download_ok=0
-
+rm -f /tmp/hysteria
+download_ok=0
 for i in 1 2 3; do
-  curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL" 2>/dev/null && download_ok=1 && break
-  wget -q --timeout=30 -O /tmp/hysteria "$HY_URL" 2>/dev/null && download_ok=1 && break
+  echo "尝试下载 $HY_URL (第 $i 次)"
+  if command -v curl >/dev/null 2>&1; then curl -4fsSL --max-time 30 -o /tmp/hysteria "$HY_URL" && download_ok=1 && break; fi
+  if command -v wget >/dev/null 2>&1; then wget -q --timeout=30 -O /tmp/hysteria "$HY_URL" && download_ok=1 && break; fi
   sleep 1
 done
-
-if [ "$download_ok" != "1" ]; then
-  for mirror in "https://ghfast.top/$HY_URL" "https://ghproxy.net/$HY_URL"; do
+if [ "$download_ok" != "1" ] || [ ! -s /tmp/hysteria ]; then
+  for mirror in "https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}" "https://ghproxy.net/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"; do
+    echo "尝试镜像 $mirror"
     curl -4fsSL --max-time 30 -o /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
+    wget -q --timeout=30 -O /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
   done
 fi
-
-[ ! -s /tmp/hysteria ] && echo -e "${RED}下载失败，请检查网络或手动下载 $HY_URL${PLAIN}" && exit 1
-
+if [ ! -s /tmp/hysteria ] || head -c 200 /tmp/hysteria 2>/dev/null | grep -qi "<html"; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
 mv /tmp/hysteria /usr/local/bin/hysteria; chmod +x /usr/local/bin/hysteria
+/usr/local/bin/hysteria version 2>&1 || true
 
-# ===== [4/6] 证书和配置 =====
-echo -e "${YELLOW}[4/6] 生成证书和配置...${PLAIN}"
-
+# ===== [4/7] 证书和配置 =====
+echo -e "${YELLOW}[4/7] 生成配置...${PLAIN}"
 if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
-  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || openssl genrsa -out /etc/hysteria/key.key 2048
-  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650
+  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || \
+  openssl genpkey -algorithm EC -pkeyopt ec_param_enc:named_curve -pkeyopt ec_paramgen_curve:P-256 -out /etc/hysteria/key.key 2>/dev/null || \
+  openssl genrsa -out /etc/hysteria/key.key 2048 2>/dev/null
+  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650 2>/dev/null || \
+  openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=bing.com" -days 3650
   chmod 600 /etc/hysteria/key.key
 fi
-
-# ===== 关键修复: 计算证书 pinSHA256 =====
-CERT_PIN_HEX=$(openssl x509 -noout -fingerprint -sha256 -in /etc/hysteria/cert.crt | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z')
-CERT_PIN_B64=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary | openssl enc -base64 | tr -d '\n')
-
-echo -e "证书 HEX pin: ${CYAN}${CERT_PIN_HEX}${PLAIN}"
-echo -e "证书 B64 pin: ${CYAN}${CERT_PIN_B64}${PLAIN}"
 
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${HY_PORT}
@@ -130,191 +119,177 @@ tls:
   cert: /etc/hysteria/cert.crt
   key: /etc/hysteria/key.key
 EOF
+cat /etc/hysteria/config.yaml
 
-# ===== [MOD] 出入口同IP: 如果指定了 -i，就同时绑定出口IP =====
-if [ -n "$CUSTOM_IP" ]; then
-cat >> /etc/hysteria/config.yaml <<EOF
-outbounds:
-  - name: default
-    type: direct
-    direct:
-      bindIPv4: ${CUSTOM_IP}
-      mode: 64
-      fastOpen: true
-EOF
-  echo -e "${YELLOW}已绑定出口IP: ${CYAN}${CUSTOM_IP}${PLAIN}${YELLOW} (出入口同IP)${PLAIN}"
-fi
+# ===== [5/7] 服务 =====
+echo -e "${YELLOW}[5/7] 配置服务...${PLAIN}"
+cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
+#!/bin/sh
+pkill -f "hysteria.*config.yaml" || true
+sleep 1
+if systemctl is-active --quiet hysteria 2>/dev/null; then systemctl restart hysteria
+else nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & fi
+echo "已重启，日志: tail -f /var/log/hysteria.log"
+RESTART
+chmod +x /usr/local/bin/hy2-restart.sh
 
-# ===== [5/6] 服务 =====
-echo -e "${YELLOW}[5/6] 启动服务...${PLAIN}"
-
-# 优先使用 systemd (Debian 标准)
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  cat > /etc/systemd/system/hysteria.service <<EOS
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  cat > /etc/systemd/system/hysteria.service <<EOF
 [Unit]
-Description=Hysteria 2 Server (Debian V3.8-mod)
+Description=Hysteria2 Server V1.2
 After=network.target
-
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=always
 RestartSec=3
-LimitNOFILE=infinity
-
+LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
-EOS
-  systemctl daemon-reload
-  systemctl enable hysteria >/dev/null 2>&1 || true
-  systemctl restart hysteria || systemctl start hysteria
-  sleep 2
-  systemctl status hysteria --no-pager -l | head -n 20 || true
+EOF
+  systemctl daemon-reload; systemctl enable hysteria >/dev/null 2>&1 || true; systemctl restart hysteria 2>&1 || systemctl start hysteria 2>&1 || true; sleep 2
 else
-  # 兼容无 systemd 的容器环境
-  echo "未检测到 systemd，使用 nohup 方式"
   pkill -f "hysteria.*config.yaml" 2>/dev/null || true; sleep 1
-  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
-  cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
-#!/bin/bash
-pkill -f "hysteria.*config.yaml" || true; sleep 1
-nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
-echo "已重启"
-RESTART
-  chmod +x /usr/local/bin/hy2-restart.sh
+  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 & sleep 2
 fi
+ss -tulpn 2>/dev/null | grep -E "$HY_PORT|hysteria" || true
+tail -n 10 /var/log/hysteria.log 2>/dev/null || true
 
-# 通用重启脚本 (systemd 也可用)
-cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
-#!/bin/bash
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  systemctl restart hysteria && echo "已通过 systemd 重启" && exit 0
-fi
-pkill -f "hysteria.*config.yaml" || true; sleep 1
-nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
-echo "已重启"
-RESTART
-chmod +x /usr/local/bin/hy2-restart.sh
-
-sleep 2; tail -n 20 /var/log/hysteria.log 2>/dev/null || journalctl -u hysteria -n 20 --no-pager 2>/dev/null || true
-
-# ===== [6/6] IP检测 =====
-is_private_ip() { case "$1" in 0.0.0.0|10.*|192.168.*|127.*|169.254.*) return 0;; 172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0;; esac; echo "$1" | grep -Eq '^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.' && return 0; return 1; }
-
-get_ssh_ip() { [ -n "$SSH_CONNECTION" ] && echo "$SSH_CONNECTION" | awk '{print $3}' && return; ss -tn 2>/dev/null | grep ':22' | awk '{print $4}' | cut -d: -f1 | grep -E '^[0-9.]+$' | grep -v '^127\.' | head -n1; }
-
+# ===== [6/7] IP检测 V3.7 =====
+echo -e "${YELLOW}[6/7] IP检测...${PLAIN}"
+is_private_ip() {
+  local ip=$1; [ -z "$ip" ] && return 0
+  case "$ip" in 0.0.0.0|10.*|192.168.*|127.*|169.254.*) return 0;; 172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*) return 0;; esac
+  if echo "$ip" | grep -Eq '^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.'; then return 0; fi; return 1
+}
+get_ssh_ip() {
+  if [ -n "$SSH_CONNECTION" ]; then echo "$SSH_CONNECTION" | awk '{print $3}'; return; fi
+  if [ -d /proc ]; then for f in /proc/[0-9]*/environ; do [ -f "$f" ] || continue; ip=$(tr '\0' '\n' < "$f" 2>/dev/null | grep '^SSH_CONNECTION=' | cut -d= -f2 | awk '{print $3}' | tail -n1); if echo "$ip" | grep -Eq '^[0-9.]+$' && [ -n "$ip" ]; then echo "$ip"; return; fi; done; fi
+  ss -tn 2>/dev/null | grep ':22' | awk '{print $4}' | cut -d: -f1 | grep -E '^[0-9.]+$' | grep -v '^127\.' | head -n1
+}
 get_pub_ip() {
-  local ip; if command -v dig >/dev/null 2>&1; then
-    for ns in "208.67.222.222" "8.8.8.8" "1.1.1.1"; do
-      ip=$(dig +short +time=2 +tries=1 @${ns} myip.opendns.com 2>/dev/null | grep -Eo '[0-9.]{7,15}' | head -n1)
-      [ -n "$ip" ] && ! is_private_ip "$ip" && echo "$ip" && return
-    done
-  fi
-  if command -v curl >/dev/null 2>&1; then
-    for api in "https://api4.ipify.org" "https://ifconfig.me/ip" "https://ip.sb"; do
-      ip=$(curl -4fsSL --max-time 4 "$api" 2>/dev/null | grep -Eo '[0-9.]{7,15}' | head -n1)
-      [ -n "$ip" ] && ! is_private_ip "$ip" && echo "$ip" && return
-    done
+  local ip
+  if command -v dig >/dev/null 2>&1; then for ns in "208.67.222.222" "8.8.8.8" "1.1.1.1"; do ip=$(dig +short +time=2 +tries=1 @${ns} myip.opendns.com 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1); if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi; done; fi
+  if command -v curl >/dev/null 2>&1; then for api in "https://api4.ipify.org" "https://ifconfig.me/ip" "https://ip.sb" "https://icanhazip.com"; do ip=$(curl -4fsSL --max-time 4 "$api" 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1); if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi; done; fi
+  if command -v wget >/dev/null 2>&1; then for api in "https://api4.ipify.org" "https://ifconfig.me"; do ip=$(wget -qO- --timeout=4 "$api" 2>/dev/null | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1); if [ -n "$ip" ] && ! is_private_ip "$ip"; then echo "$ip"; return; fi; done; fi
+}
+if [ -n "$CUSTOM_IP" ]; then SERVER_IP=$CUSTOM_IP; echo -e "${GREEN}手动指定 -i: $SERVER_IP${PLAIN}"
+else
+  SIP=$(get_ssh_ip); PIP=$(get_pub_ip)
+  echo -e " SSH会话IP: ${YELLOW}${SIP:-未找到}${PLAIN} | 出口公网IP: ${YELLOW}${PIP:-未知}${PLAIN}"
+  if [ -z "$SIP" ] && [ -n "$PIP" ]; then SERVER_IP=$PIP
+  elif [ -z "$SIP" ] && [ -z "$PIP" ]; then SERVER_IP=""
+  elif is_private_ip "$SIP"; then if [ -n "$PIP" ]; then SERVER_IP=$PIP; else SERVER_IP=$SIP; fi
+  else SERVER_IP=$SIP; fi
+fi
+if [ -z "$SERVER_IP" ]; then echo -e "${RED}无法获取IP，请用 -i 指定${PLAIN}"; SERVER_IP="YOUR_PUBLIC_IP"; fi
+
+# ===== [7/7] 证书pin + Karing修复 + 客户端配置 =====
+echo -e "${YELLOW}[7/7] 生成证书pin与客户端配置 (Karing修复)...${PLAIN}"
+
+urlencode() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+  else
+    printf '%s' "$1" | sed -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g' -e 's/:/%3A/g'
   fi
 }
 
-if [ -n "$CUSTOM_IP" ]; then SERVER_IP=$CUSTOM_IP
-else SIP=$(get_ssh_ip); PIP=$(get_pub_ip); if is_private_ip "$SIP"; then [ -n "$PIP" ] && SERVER_IP=$PIP || SERVER_IP=$SIP; else [ -n "$SIP" ] && SERVER_IP=$SIP || SERVER_IP=$PIP; fi; fi
+CERT_PIN=""; CERT_PIN_ENC=""; CERT_FPR=""; CERT_DATES=""
+if [ -f /etc/hysteria/cert.crt ]; then
+  # pinSHA256 = base64(sha256(spki))
+  if openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null > /tmp/pin.tmp; then
+    CERT_PIN=$(cat /tmp/pin.tmp | tr -d '\n')
+  else
+    CERT_PIN=$(openssl x509 -in /etc/hysteria/cert.crt -pubkey -noout 2>/dev/null | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null | tr -d '\n')
+  fi
+  rm -f /tmp/pin.tmp
+  CERT_PIN_ENC=$(urlencode "$CERT_PIN")
+  CERT_FPR=$(openssl x509 -in /etc/hysteria/cert.crt -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+  CERT_DATES=$(openssl x509 -in /etc/hysteria/cert.crt -noout -dates 2>/dev/null | tr '\n' ' ')
+fi
 
-[ -z "$SERVER_IP" ] && SERVER_IP="YOUR_PUBLIC_IP"
+# 备份证书
+cp /etc/hysteria/cert.crt /root/hy2-cert.crt 2>/dev/null || true
+cp /etc/hysteria/cert.crt /etc/hysteria/client.crt 2>/dev/null || true
+chmod 644 /root/hy2-cert.crt 2>/dev/null || true
 
-# ===== [7/6] 关键新增: 生成 v2rayN/Karing 可用连接 =====
-echo -e "${YELLOW}[7/6] 生成 v2rayN / Karing 客户端配置...${PLAIN}"
-
-LINK_INSECURE="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Debian-Hy2-V3.8-mod-Insecure"
-LINK_PIN_HEX="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${CERT_PIN_HEX}#Debian-Hy2-V3.8-mod-PIN"
-LINK_PIN_B64="hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${CERT_PIN_B64}#Debian-Hy2-V3.8-mod-PIN-B64"
-
-mkdir -p /root
-cat > /etc/hysteria/client.yaml <<EOF
+# 1. sing-box / 官方客户端 YAML
+cat > /root/hy2-client.yaml <<EOF
 server: ${SERVER_IP}:${HY_PORT}
 auth: ${HY_PASS}
 tls:
   sni: bing.com
-  insecure: true
-  pinSHA256: ${CERT_PIN_HEX}
-bandwidth:
-  up: 20 mbps
-  down: 100 mbps
+  pinSHA256: ${CERT_PIN}
 socks5:
   listen: 127.0.0.1:1080
 http:
   listen: 127.0.0.1:8080
 EOF
 
+# 2. Clash.Meta / Karing 专用 YAML (最稳)
+cat > /root/hy2-clash.yaml <<EOF
+# Karing / Clash.Meta / Mihomo 专用 - 直接导入
+proxies:
+  - name: Hy2-${SERVER_IP}
+    type: hysteria2
+    server: ${SERVER_IP}
+    port: ${HY_PORT}
+    password: ${HY_PASS}
+    sni: bing.com
+    skip-cert-verify: false
+    pinSHA256: ${CERT_PIN}
+    # 如果上面在你的Karing版本报错，注释掉上面两行，启用下面两行
+    # skip-cert-verify: true
+    # fingerprint: chrome
+EOF
+
+# 3. sing-box JSON (Karing 也支持)
 cat > /root/hy2-singbox.json <<EOF
 {
-  "outbounds": [{
-    "type": "hysteria2",
-    "tag": "hy2",
-    "server": "${SERVER_IP}",
-    "server_port": ${HY_PORT},
-    "password": "${HY_PASS}",
-    "tls": {
-      "enabled": true,
-      "server_name": "bing.com",
-      "insecure": false,
-      "pinSHA256": "${CERT_PIN_HEX}"
-    }
-  }]
+  "type": "hysteria2",
+  "tag": "Hy2-${SERVER_IP}",
+  "server": "${SERVER_IP}",
+  "server_port": ${HY_PORT},
+  "password": "${HY_PASS}",
+  "tls": {
+    "enabled": true,
+    "server_name": "bing.com",
+    "pinSHA256": "${CERT_PIN}",
+    "insecure": false,
+    "alpn": "h3"
+  }
 }
 EOF
 
-cat > /root/hy2-links.txt <<EOF
-# Hysteria2 V3.8-mod Debian 客户端
-端口: ${HY_PORT}
-密码: ${HY_PASS}
-IP: ${SERVER_IP}
-出入口绑定IP: ${CUSTOM_IP:-自动}
-SNI: bing.com
-HEX PIN: ${CERT_PIN_HEX}
-B64 PIN: ${CERT_PIN_B64}
-
-1. v2rayN / v2rayNG 通用 (推荐先用这个):
-${LINK_INSECURE}
-
-2. Karing / Hiddify 安全版 (不跳过验证):
-${LINK_PIN_HEX}
-
-3. Karing B64版 (部分版本需要):
-${LINK_PIN_B64}
-
-客户端文件:
-- /etc/hysteria/client.yaml (hysteria官方客户端直接用)
-- /etc/hysteria/cert.crt (可手动导入)
-- /root/hy2-singbox.json
-
-服务管理:
-- systemctl status hysteria
-- systemctl restart hysteria
-- journalctl -u hysteria -f
-- /usr/local/bin/hy2-restart.sh
-EOF
-
-chmod 600 /root/hy2-links.txt /etc/hysteria/client.yaml /root/hy2-singbox.json
-
+# ===== 最终输出 =====
 echo ""
-echo -e "${GREEN}========== V3.8-mod Debian 完成 (出入口同IP) ==========${PLAIN}"
-echo -e "端口: ${CYAN}${HY_PORT}${PLAIN}  密码: ${CYAN}${HY_PASS}${PLAIN}  IP: ${CYAN}${SERVER_IP}${PLAIN}"
-if [ -n "$CUSTOM_IP" ]; then
-  echo -e "出口绑定: ${CYAN}${CUSTOM_IP}${PLAIN}"
-fi
+echo -e "${GREEN}========== Debian V1.2 完成 (Karing修复版) ==========${PLAIN}"
+echo -e "端口: ${CYAN}${HY_PORT}${PLAIN} | 密码: ${CYAN}${HY_PASS}${PLAIN} | IP: ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e "证书指纹: ${CYAN}${CERT_FPR}${PLAIN}"
+echo -e "pin原始: ${CYAN}${CERT_PIN}${PLAIN}"
+echo -e "pin编码: ${CYAN}${CERT_PIN_ENC}${PLAIN}"
 echo -e ""
-echo -e "${YELLOW}v2rayN / v2rayNG 直接导入 (insecure):${PLAIN}"
-echo -e "${GREEN}${LINK_INSECURE}${PLAIN}"
+echo -e "${GREEN}--- [Karing/Clash专用-推荐] 分享链接 (URL编码后) ---${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&pinSHA256=${CERT_PIN_ENC}#Hy2-Karing-Pin${PLAIN}"
 echo -e ""
-echo -e "${YELLOW}Karing / Hiddify 推荐 (pinSHA256 安全):${PLAIN}"
-echo -e "${GREEN}${LINK_PIN_HEX}${PLAIN}"
+echo -e "${YELLOW}--- [Karing兼容-带insecure] 如果上面还不行用这个 ---${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1&pinSHA256=${CERT_PIN_ENC}#Hy2-Karing-InsecurePin${PLAIN}"
 echo -e ""
-echo -e "配置文件已导出:"
-echo -e "  cat /root/hy2-links.txt"
-echo -e "  cat /etc/hysteria/client.yaml"
-echo -e "  cat /etc/hysteria/cert.crt"
-echo -e "  cat /root/hy2-singbox.json"
+echo -e "${YELLOW}--- [通用兼容] 分享链接 (insecure) ---${PLAIN}"
+echo -e "${GREEN}hysteria2://${HY_PASS}@${SERVER_IP}:${HY_PORT}/?sni=bing.com&insecure=1#Hy2-Insecure${PLAIN}"
 echo -e ""
-echo -e "服务: systemctl status hysteria | 日志: journalctl -u hysteria -f"
+echo -e "${CYAN}--- Clash YAML (Karing最稳) 路径: /root/hy2-clash.yaml ---${PLAIN}"
+cat /root/hy2-clash.yaml
+echo -e ""
+echo -e "${CYAN}--- 证书内容 ---${PLAIN}"
+cat /etc/hysteria/cert.crt
+echo -e ""
+echo -e "管理命令:"
+echo -e "  日志: tail -f /var/log/hysteria.log"
+echo -e "  重启: /usr/local/bin/hy2-restart.sh"
+echo -e "  客户端: cat /root/hy2-client.yaml"
+echo -e "  Clash: cat /root/hy2-clash.yaml"
+echo -e "  JSON: cat /root/hy2-singbox.json"
+echo -e "  证书: cat /root/hy2-cert.crt"
+echo -e "  放行: UDP ${HY_PORT}"
