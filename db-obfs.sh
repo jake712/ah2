@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hysteria 2 Debian V1.1 - NAT/Podman/LXC 高级防封锁增强版
+# Hysteria 2 Debian V1.1 - NAT/Podman/LXC 高级防封锁增强版 (NAT单端口专用)
 # 适配: Debian 11/12/13, Ubuntu 20.04+, Karing 客户端完美适配版
 
 set -e
@@ -17,11 +17,11 @@ done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Debian V1.1 Karing高强度防封锁版 ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 Debian V1.1 Karing高强度防封锁版 (NAT单端口) ===${PLAIN}"
 echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
 
-# ===== [1/6] 基础依赖 - Debian适配 =====
-echo -e "${YELLOW}[1/6] 检查依赖 (Debian低内存模式)...${PLAIN}"
+# ===== [1/5] 基础依赖 - Debian适配 =====
+echo -e "${YELLOW}[1/5] 检查依赖 (Debian低内存模式)...${PLAIN}"
 export DEBIAN_FRONTEND=noninteractive
 
 if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
@@ -74,8 +74,8 @@ if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
   update-ca-certificates 2>/dev/null || true
 fi
 
-# ===== [2/6] 参数和路径 (新增: 随机混淆密码) =====
-echo -e "${YELLOW}[2/6] 初始化参数...${PLAIN}"
+# ===== [2/5] 参数和路径 =====
+echo -e "${YELLOW}[2/5] 初始化参数...${PLAIN}"
 HY_PORT=${CUSTOM_PORT:-26169}
 
 # 随机生成 Karing 所需的混淆密码 (obfs password)
@@ -89,15 +89,6 @@ fi
 [ -n "$CUSTOM_PASSWORD" ] && HY_PASS=$CUSTOM_PASSWORD
 [ -z "$HY_PASS" ] && HY_PASS="Hy2Pass$(date +%s | tail -c 4)"
 
-# 端口跳跃范围设置 (主端口 + 额外1000个跳跃端口，防UDP单端口封锁)
-HOPPING_START=$((HY_PORT + 1))
-HOPPING_END=$((HY_PORT + 1000))
-# 如果端口太大超过边界，换个安全范围
-if [ $HOPPING_END -gt 65535 ]; then
-  HOPPING_START=50000
-  HOPPING_END=51000
-fi
-
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) HY_ARCH="amd64" ;;
@@ -109,8 +100,8 @@ esac
 mkdir -p /etc/hysteria /usr/local/bin /run/hysteria /var/log
 chmod 700 /etc/hysteria 2>/dev/null || true
 
-# ===== [3/6] 下载 Hysteria2 =====
-echo -e "${YELLOW}[3/6] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
+# ===== [3/5] 下载 Hysteria2 =====
+echo -e "${YELLOW}[3/5] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
 HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
 rm -f /tmp/hysteria
 download_ok=0
@@ -131,8 +122,8 @@ if [ ! -s /tmp/hysteria ]; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
 mv /tmp/hysteria /usr/local/bin/hysteria
 chmod +x /usr/local/bin/hysteria
 
-# ===== [4/6] 生成随机伪装证书和高级配置 =====
-echo -e "${YELLOW}[4/6] 生成防封锁混淆配置...${PLAIN}"
+# ===== [4/5] 生成随机伪装证书和高级配置 =====
+echo -e "${YELLOW}[4/5] 生成防封锁混淆配置...${PLAIN}"
 
 # 伪装域名随机池，拒绝单一特征
 DOMAINS="apple.com cloudflare.com icloud.com microsoft.com windows.com weather.com"
@@ -145,10 +136,9 @@ if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   chmod 600 /etc/hysteria/key.key
 fi
 
-# 写入带有 obfs 混淆与端口跳跃的全新配置文件
+# 写入配置文件 (已完全移除端口跳跃配置)
 cat > /etc/hysteria/config.yaml <<EOF
-# 监听主端口以及跳跃端口范围
-listen: :${HY_PORT},:${HOPPING_START}-${HOPPING_END}
+listen: :${HY_PORT}
 
 auth:
   type: password
@@ -171,8 +161,8 @@ tls:
   key: /etc/hysteria/key.key
 EOF
 
-# ===== [5/6] 服务 - Debian/Podman兼容 =====
-echo -e "${YELLOW}[5/6] 配置并启动服务...${PLAIN}"
+# ===== [5/5] 服务 - Debian/Podman兼容 =====
+echo -e "${YELLOW}[5/5] 配置并启动服务...${PLAIN}"
 
 cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
 #!/bin/sh
@@ -211,27 +201,24 @@ else
   nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 fi
 
-# ===== [6/6] 获取公网 IP 并输出 Karing 专用配置 =====
-echo -e "${YELLOW}[6/6] 生成 Karing 客户端配置信息...${PLAIN}"
-
+# 输出 Karing 专用配置
 SERVER_IP=$CUSTOM_IP
 if [ -z "$SERVER_IP" ]; then
   SERVER_IP=$(curl -4s --max-time 5 api.ipify.org || curl -4s --max-time 5 ifconfig.me || echo "你的服务器IP")
 fi
 
 echo -e "\n${GREEN}================================================"
-echo -e "Hysteria 2 高强度防封锁节点部署成功！"
+echo -e "Hysteria 2 高强度防封锁节点部署成功！(NAT单端口版)"
 echo -e "================================================${PLAIN}"
 echo -e "${CYAN}[Karing 客户端手动填入参数]:${PLAIN}"
 echo -e "  - ${YELLOW}服务器地址 (Address):${PLAIN} ${SERVER_IP}"
-echo -e "  - ${YELLOW}主端口 (Port):${PLAIN} ${HY_PORT}"
-echo -e "  - ${YELLOW}端口跳跃 (Port Hopping):${PLAIN} ${HOPPING_START}-${HOPPING_END}"
+echo -e "  - ${YELLOW}主端口 (Port):${PLAIN} ${HY_PORT} (请自行填写映射后的外网端口)"
 echo -e "  - ${YELLOW}认证密码 (Password):${PLAIN} ${HY_PASS}"
 echo -e "  - ${YELLOW}混淆类型 (Obfs Type):${PLAIN} salamander"
 echo -e "  - ${YELLOW}混淆密码 (Obfs Password):${PLAIN} ${HY_OBFS_PASS}"
 echo -e "  - ${YELLOW}SNI / 伪装域名:${PLAIN} ${RANDOM_SNI}"
-echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True) / 因为是自签证书"
+echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True)"
 echo -e "------------------------------------------------"
-echo -e "${CYAN}[标准 Hysteria2 节点链接 (可尝试直接导入 Karing)]:${PLAIN}"
-echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}&mport=${HOPPING_START}-${HOPPING_END}"
+echo -e "${CYAN}[标准 Hysteria2 节点链接 (已移除了 mport 参数)]:${PLAIN}"
+echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
 echo -e "================================================"
