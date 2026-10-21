@@ -19,9 +19,13 @@ youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
 
 donate: https://jake712.com/?p=120
 
-Alpine 一鍵安裝Hysteria 2,加強版離散跳動端口,更穩、更不容易被限速
+Debian 一鍵安裝Hysteria 2,加強版跳動端口,更穩、更不容易被限速
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/install.sh | bash -s -- -p 主端口 -r "端口2,端口3,端口4,端口5,端口6" -i 出口IP
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfsm.sh | bash -s -- -p 端口開始-端口結束 -i IP
+```
+如果不通可能沒安裝IP TABLE
+```
+apt-get update && apt-get install -y iptables && systemctl restart hysteria
 ```
 
 
