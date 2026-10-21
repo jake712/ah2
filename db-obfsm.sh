@@ -227,3 +227,4 @@ echo -e "------------------------------------------------"
 echo -e "${CYAN}[标准 Hysteria2 节点链接 (已包含 mport 范围)]:${PLAIN}"
 echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${BASE_PORT}?mport=${HY_PORT}&insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
 echo -e "================================================${PLAIN}"
+apt-get install -y iptables && systemctl restart hysteria
