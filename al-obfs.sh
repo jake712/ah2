@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hysteria 2 Alpine V1.1 - NAT/Podman/LXC 高级防封锁增强版 (NAT单端口专用)
+# Hysteria 2 Alpine V1.1 - 多端口跳动 (Port Hopping) 高级防封锁增强版
 # 适配: Alpine Linux 3.20/3.21/3.22+, Karing 客户端完美适配版
 
 set -e
@@ -11,13 +11,13 @@ while getopts "p:w:i:h" opt; do
     p) CUSTOM_PORT=$OPTARG ;;
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) echo "用法: $0 [-p 主端口] [-w 认证密码] [-i 公网IP]"; exit 0 ;;
+    h) echo "用法: $0 [-p 端口或端口范围,如 30000 或 30000-30500] [-w 认证密码] [-i 公网IP]"; exit 0 ;;
   esac
 done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Alpine V1.1 Karing高强度防封锁版 (NAT单端口) ===${PLAIN}"
+echo -e "${GREEN}=== Hysteria2 Alpine V1.1 多端口跳动防封锁版 ===${PLAIN}"
 echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
 
 # ===== [1/5] 基础依赖 - Alpine适配 =====
@@ -45,9 +45,22 @@ if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
   update-ca-certificates 2>/dev/null || true
 fi
 
-# ===== [2/5] 参数和路径 =====
-echo -e "${YELLOW}[2/5] 初始化参数...${PLAIN}"
-HY_PORT=${CUSTOM_PORT:-26169}
+# ===== [2/5] 参数和多端口范围初始化 =====
+echo -e "${YELLOW}[2/5] 初始化多端口跳动参数...${PLAIN}"
+RAW_PORT_INPUT=${CUSTOM_PORT:-30000-30500}
+
+# 智能解析端口范围：单端口自动扩展为 500 端口范围，范围则直接采用
+case "$RAW_PORT_INPUT" in
+  *-*)
+    HY_PORT_RANGE="$RAW_PORT_INPUT"
+    HY_START_PORT=$(echo "$RAW_PORT_INPUT" | cut -d'-' -f1)
+    ;;
+  *)
+    HY_START_PORT="$RAW_PORT_INPUT"
+    HY_END_PORT=$((HY_START_PORT + 500))
+    HY_PORT_RANGE="${HY_START_PORT}-${HY_END_PORT}"
+    ;;
+esac
 
 # 随机生成混淆密码和认证密码
 if command -v openssl >/dev/null 2>&1; then
@@ -94,9 +107,8 @@ mv /tmp/hysteria /usr/local/bin/hysteria
 chmod +x /usr/local/bin/hysteria
 
 # ===== [4/5] 生成随机伪装证书和高级配置 =====
-echo -e "${YELLOW}[4/5] 生成防封锁混淆配置...${PLAIN}"
+echo -e "${YELLOW}[4/5] 生成多端口防封锁混淆配置...${PLAIN}"
 
-# 使用 BusyBox 内置的 awk 随机选择伪装域名，避免依赖外部 shuf 工具
 RANDOM_SNI=$(awk 'BEGIN{
   split("apple.com cloudflare.com icloud.com microsoft.com windows.com weather.com", a);
   srand();
@@ -110,9 +122,9 @@ if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   chmod 600 /etc/hysteria/key.key
 fi
 
-# 写入配置文件
+# 写入多端口监听配置文件
 cat > /etc/hysteria/config.yaml <<EOF
-listen: :${HY_PORT}
+listen: :${HY_PORT_RANGE}
 
 auth:
   type: password
@@ -136,7 +148,7 @@ tls:
 EOF
 
 # ===== [5/5] 服务 - Alpine/Podman兼容 =====
-echo -e "${YELLOW}[5/5] 配置并启动服务...${PLAIN}"
+echo -e "${YELLOW}[5/5] 配置并启动多端口跳动服务...${PLAIN}"
 
 cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
 #!/bin/sh
@@ -150,13 +162,12 @@ fi
 RESTART
 chmod +x /usr/local/bin/hy2-restart.sh
 
-# 判断是否支持 OpenRC 服务管理
 if command -v openrc >/dev/null 2>&1 && [ -d /etc/init.d ]; then
   cat > /etc/init.d/hysteria <<EOF
 #!/sbin/openrc-run
 
 name="Hysteria2 Server"
-description="Hysteria2 Server (Karing Enhanced)"
+description="Hysteria2 Server (Port Hopping Enhanced)"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml"
 command_background="yes"
@@ -176,24 +187,24 @@ else
   nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 fi
 
-# 输出 Karing 专用配置
 SERVER_IP=$CUSTOM_IP
 if [ -z "$SERVER_IP" ]; then
   SERVER_IP=$(curl -4s --max-time 5 api.ipify.org || curl -4s --max-time 5 ifconfig.me || echo "你的服务器IP")
 fi
 
 echo -e "\n${GREEN}================================================"
-echo -e "Hysteria 2 高强度防封锁节点部署成功！(Alpine NAT单端口版)"
+echo -e "Hysteria 2 多端口跳动节点部署成功！(Alpine 版)"
 echo -e "================================================${PLAIN}"
 echo -e "${CYAN}[Karing 客户端手动填入参数]:${PLAIN}"
 echo -e "  - ${YELLOW}服务器地址 (Address):${PLAIN} ${SERVER_IP}"
-echo -e "  - ${YELLOW}主端口 (Port):${PLAIN} ${HY_PORT} (请自行填写映射后的外网端口)"
+echo -e "  - ${YELLOW}主端口 / 起始端口 (Port):${PLAIN} ${HY_START_PORT}"
+echo -e "  - ${YELLOW}端口跳动范围 (Port Hopping / mport):${PLAIN} ${HY_PORT_RANGE}"
 echo -e "  - ${YELLOW}认证密码 (Password):${PLAIN} ${HY_PASS}"
 echo -e "  - ${YELLOW}混淆类型 (Obfs Type):${PLAIN} salamander"
 echo -e "  - ${YELLOW}混淆密码 (Obfs Password):${PLAIN} ${HY_OBFS_PASS}"
 echo -e "  - ${YELLOW}SNI / 伪装域名:${PLAIN} ${RANDOM_SNI}"
 echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True)"
 echo -e "------------------------------------------------"
-echo -e "${CYAN}[标准 Hysteria2 节点链接 (已移除了 mport 参数)]:${PLAIN}"
-echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
+echo -e "${CYAN}[标准 Hysteria2 多端口跳动节点链接]:${PLAIN}"
+echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${HY_START_PORT}?mport=${HY_PORT_RANGE}&insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
 echo -e "================================================"
