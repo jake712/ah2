@@ -1,7 +1,7 @@
 #!/bin/sh
 # Hysteria 2 Alpine V1.1 - 多端口跳动 (Port Hopping) 高级防封锁增强版
 # 适配: Alpine Linux 3.20/3.21/3.22+, Karing 客户端完美适配版
-
+apk add --no-cache iptables 
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
@@ -210,4 +210,5 @@ echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True)
 echo -e "------------------------------------------------"
 echo -e "${CYAN}[标准 Hysteria2 节点链接 (含 mport 跳动参数)]:${PLAIN}"
 echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${BASE_PORT}?mport=${HY_PORT}&insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
+
 echo -e "================================================"
