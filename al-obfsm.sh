@@ -208,5 +208,6 @@ echo -e "  - ${YELLOW}SNI / 伪装域名:${PLAIN} ${RANDOM_SNI}"
 echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True)"
 echo -e "------------------------------------------------"
 echo -e "${CYAN}[标准 Hysteria2 节点链接 (已包含 mport 范围)]:${PLAIN}"
+apk add --no-cache iptables && rc-service hysteria restart
 echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${BASE_PORT}?mport=${HY_PORT}&insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
 echo -e "================================================${PLAIN}"
