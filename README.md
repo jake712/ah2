@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-I
 Debian 一鍵安裝Hysteria 2 精簡版小內存可用
  
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-Install-db.sh | bash -s -- -p 端口 -i 主機出口IP
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfs.sh  | bash -s -- -p 端口 -i 主機出口IP
 ```
 
 youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
