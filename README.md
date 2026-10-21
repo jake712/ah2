@@ -6,7 +6,7 @@ v2n core核心要改為sing_box
 
 Alpine 一鍵安裝Hysteria 2 精簡版小內存可用
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/Hysteria2-Alpine-Install-V2.sh | bash -s -- -p 端口 -i 主機IP
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/al-obfsm.sh | bash -s -- -p 端口開始-端口結束 -i 主機出口IP
 ```
 
 Debian 一鍵安裝Hysteria 2 精簡版小內存可用
@@ -21,7 +21,7 @@ donate: https://jake712.com/?p=120
 
 Debian 一鍵安裝Hysteria 2,加強版跳動端口,更穩、更不容易被限速
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfsm.sh | bash -s -- -p 端口開始-端口結束 -i IP
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfsm.sh | bash -s -- -p 端口開始-端口結束 -i 主機出口IP
 ```
 如果不通可能沒安裝IP TABLE
 ```
