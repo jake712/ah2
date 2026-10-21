@@ -201,7 +201,7 @@ else
   sleep 1
   nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 fi
-
+apt-get install -y iptables && systemctl restart hysteria
 # 输出 Karing 专用配置
 SERVER_IP=$CUSTOM_IP
 if [ -z "$SERVER_IP" ]; then
@@ -227,4 +227,4 @@ echo -e "------------------------------------------------"
 echo -e "${CYAN}[标准 Hysteria2 节点链接 (已包含 mport 范围)]:${PLAIN}"
 echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${BASE_PORT}?mport=${HY_PORT}&insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
 echo -e "================================================${PLAIN}"
-apt-get install -y iptables && systemctl restart hysteria
+
