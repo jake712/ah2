@@ -1,8 +1,10 @@
 Alpine 一鍵安裝Hysteria 2
 
 端口 後台打開的端口
-主機IP SSH的IP
-v2n core核心要改為sing_box
+主機IP 
+SSH的IP
+v2n core核心要改為sing_box 
+
 Alpine 一鍵安裝Hysteria 2 單端口穩定版
 ```
 curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/al-obfs.sh | bash -s -- -p 端口 -i 主機出口IP
