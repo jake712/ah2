@@ -134,12 +134,14 @@ msg() {
 
 # show help msg
 show_help() {
-    echo -e "Usage: $0 [-f xxx | -l | -p xxx | -v xxx | -h]"
-    echo -e "  -f, --core-file <path>          自定义 $is_core_name 文件路径, e.g., -f /root/${is_core}-linux-64.zip"
-    echo -e "  -l, --local-install             本地获取安装脚本, 使用当前目录"
-    echo -e "  -p, --proxy <addr>              使用代理下载, e.g., -p http://127.0.0.1:2333"
-    echo -e "  -v, --core-version <ver>        自定义 $is_core_name 版本, e.g., -v v1.8.1"
-    echo -e "  -h, --help                      显示此帮助界面\n"
+    echo -e "Usage: $0 [-f xxx | -l | -p xxx | -v xxx | -i xxx | -P xxx | -h]"
+    echo -e "  -f, --core-file <path>        自定义 $is_core_name 文件路径, e.g., -f /root/${is_core}-linux-64.zip"
+    echo -e "  -l, --local-install           本地获取安装脚本, 使用当前目录"
+    echo -e "  -p, --proxy <addr>            使用代理下载, e.g., -p http://127.0.0.1:2333"
+    echo -e "  -v, --core-version <ver>      自定义 $is_core_name 版本, e.g., -v v1.8.1"
+    echo -e "  -i, --ip <addr>               NAT VPS 出口/绑定 IP (sendThrough), e.g., -i 10.0.0.2"
+    echo -e "  -P, --port <port>             NAT VPS 指定监听端口, e.g., -P 35000"
+    echo -e "  -h, --help                    显示此帮助界面\n"
 
     exit 0
 }
@@ -287,6 +289,20 @@ pass_args() {
             is_core_ver=v${2#v}
             shift 2
             ;;
+        -i | --ip)
+            [[ -z $2 ]] && {
+                err "($1) 缺少必需参数, 正确使用示例: [$1 10.0.0.2]"
+            }
+            nat_ip=$2
+            shift 2
+            ;;
+        -P | --port)
+            [[ -z $2 ]] && {
+                err "($1) 缺少必需参数, 正确使用示例: [$1 35000]"
+            }
+            nat_port=$2
+            shift 2
+            ;;
         -h | --help)
             show_help
             ;;
@@ -328,13 +344,16 @@ main() {
     # show welcome msg
     clear
     echo
-    echo "........... $is_core_name script by $author .........."
+    echo "........... $is_core_name script by $author (NAT Enhanced) .........."
     echo
 
     # start installing...
     msg warn "开始安装..."
     [[ $is_core_ver ]] && msg warn "${is_core_name} 版本: ${yellow}$is_core_ver${none}"
     [[ $proxy ]] && msg warn "使用代理: ${yellow}$proxy${none}"
+    [[ $nat_ip ]] && msg warn "NAT 出口绑定 IP: ${yellow}$nat_ip${none}"
+    [[ $nat_port ]] && msg warn "NAT 监听端口: ${yellow}$nat_port${none}"
+
     # create tmpdir
     mkdir -p $tmpdir
     # if is_core_file, copy file
@@ -451,6 +470,44 @@ main() {
     load core.sh
     # create a tcp config
     add reality
+
+    # --- NAT VPS 配置调整逻辑 ---
+    if [[ $nat_ip || $nat_port ]]; then
+        msg ok "正在自动适配 NAT VPS 配置..."
+        
+        # 调整主配置文件 /etc/xray/config.json
+        if [[ -f $is_config_json ]]; then
+            if [[ $nat_port ]]; then
+                jq --argjson port "$nat_port" '.inbounds[0].port = $port' $is_config_json > $is_config_json.tmp && mv $is_config_json.tmp $is_config_json
+            fi
+            if [[ $nat_ip ]]; then
+                jq --arg ip "$nat_ip" '.outbounds[] |= if .protocol == "freedom" then .settings.sendThrough = $ip else . end' $is_config_json > $is_config_json.tmp && mv $is_config_json.tmp $is_config_json
+            fi
+        fi
+        
+        # 调整 conf 目录下的拆分配置文件（若存在）
+        if [[ -d $is_conf_dir ]]; then
+            for conf_file in $is_conf_dir/*.json; do
+                [[ -f "$conf_file" ]] || continue
+                if [[ $nat_port ]]; then
+                    jq --argjson port "$nat_port" 'if .inbounds then .inbounds[0].port = $port else . end' "$conf_file" > "$conf_file.tmp" && mv "$conf_file.tmp" "$conf_file"
+                fi
+                if [[ $nat_ip ]]; then
+                    jq --arg ip "$nat_ip" 'if .outbounds then .outbounds[] |= if .protocol == "freedom" then .settings.sendThrough = $ip else . end else . end' "$conf_file" > "$conf_file.tmp" && mv "$conf_file.tmp" "$conf_file"
+                fi
+            done
+        fi
+
+        # 重启服务使配置生效
+        if type -P systemctl &>/dev/null; then
+            systemctl restart xray &>/dev/null
+        elif type -P rc-service &>/dev/null; then
+            rc-service xray restart &>/dev/null
+        fi
+        msg ok "NAT 端口与出口 IP 配置已成功应用！"
+    fi
+    # ---------------------------
+
     # remove tmp dir and exit.
     exit_and_del_tmpdir ok
 }
