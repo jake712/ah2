@@ -1,6 +1,6 @@
 #!/bin/sh
-# Hysteria 2 Alpine V1.3 - 智能测速优选 SNI 高级防封锁版 (NAT单端口专用)
-# 适配: Alpine Linux 3.16+, Karing 客户端完美适配版
+# Hysteria 2 Alpine V1.3 - 单端口版 (含防主动探测 & 智能优选 SNI)
+# 适配: Alpine Linux 3.20/3.21/3.22+, Karing 客户端完美适配版
 
 set -e
 
@@ -17,31 +17,43 @@ while getopts "p:w:i:s:h" opt; do
     w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
     s) CUSTOM_SNI=$OPTARG ;;
-    h) echo "用法: $0 [-p 主端口] [-w 认证密码] [-i 公网IP] [-s 伪装域名]"; exit 0 ;;
+    h) echo "用法: $0 [-p 端口] [-w 认证密码] [-i 公网IP] [-s 自定义SNI域名]"; exit 0 ;;
   esac
 done
 
 if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
 
-echo -e "${GREEN}=== Hysteria2 Alpine V1.3 智能优选SNI防封锁版 ===${PLAIN}"
-echo -e "主机名: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
+echo -e "${GREEN}=== Hysteria2 Alpine V1.3 单端口版 (防封优化SNI) ===${PLAIN}"
+echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
 
 # ===== [1/5] 基础依赖 - Alpine适配 =====
 echo -e "${YELLOW}[1/5] 检查并安装 Alpine 依赖...${PLAIN}"
+
+if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
+  echo -e "${YELLOW}检测到 Podman (dns.podman)，保留原有 DNS${PLAIN}"
+else
+  if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
+    echo -e "${YELLOW}修复 DNS...${PLAIN}"
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  fi
+fi
 
 if ! command -v apk >/dev/null 2>&1; then
   echo -e "${RED}未检测到 apk，不是 Alpine Linux 系统${PLAIN}"; exit 1
 fi
 
+echo -e "${YELLOW}更新 apk 软件源并安装必要工具...${PLAIN}"
 apk update -q
+apk add --no-cache curl openssl bind-tools iproute2 ca-certificates
 
-# 安装必要依赖包
-apk add --no-cache curl openssl iproute2 bind-tools ca-certificates grep coreutils sed awk 2>/dev/null || true
-update-ca-certificates 2>/dev/null || true
+if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
+  update-ca-certificates 2>/dev/null || true
+fi
 
-# ===== [2/5] 参数和路径 =====
-echo -e "${YELLOW}[2/5] 初始化参数...${PLAIN}"
-HY_PORT=${CUSTOM_PORT:-26169}
+# ===== [2/5] 参数和端口初始化 =====
+echo -e "${YELLOW}[2/5] 初始化端口参数...${PLAIN}"
+HY_PORT=${CUSTOM_PORT:-30000}
 
 # 随机生成混淆密码和认证密码
 if command -v openssl >/dev/null 2>&1; then
@@ -57,8 +69,8 @@ fi
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) HY_ARCH="amd64" ;;
-  aarch64|armv8*|arm64) HY_ARCH="arm64" ;;
-  armv7l|armhf|arm) HY_ARCH="arm" ;;
+  aarch64|arm64) HY_ARCH="arm64" ;;
+  armv7l|arm) HY_ARCH="arm" ;;
   *) HY_ARCH="amd64" ;;
 esac
 
@@ -87,49 +99,38 @@ if [ ! -s /tmp/hysteria ]; then echo -e "${RED}下载失败${PLAIN}"; exit 1; fi
 mv /tmp/hysteria /usr/local/bin/hysteria
 chmod +x /usr/local/bin/hysteria
 
-# ===== [4/5] 智能测速优选 SNI 与证书生成 =====
-echo -e "${YELLOW}[4/5] 正在智能测速并优选最佳伪装域名 (SNI)...${PLAIN}"
-
-DOMAINS="www.bing.com aws.amazon.com cdn.shopify.com azure.microsoft.com www.cloudflare.com"
-BEST_SNI=""
-FASTEST_TIME=999.0
+# ===== [4/5] 智能优选或指定防封 SNI =====
+echo -e "${YELLOW}[4/5] 配置 SNI 及证书...${PLAIN}"
 
 if [ -n "$CUSTOM_SNI" ]; then
-  BEST_SNI="$CUSTOM_SNI"
-  echo -e "${GREEN}✓ 使用用户指定的 SNI: ${BEST_SNI}${PLAIN}"
+  OPTIMIZED_SNI="$CUSTOM_SNI"
+  echo -e "${GREEN}✔ 使用用户指定的自定义 SNI: ${OPTIMIZED_SNI}${PLAIN}"
 else
-  for domain in $DOMAINS; do
-    result=$(curl -4 -o /dev/null -s -w "%{http_code} %{time_total}" --max-time 2 "https://$domain" 2>/dev/null || echo "000 999")
-    code=$(echo "$result" | awk '{print $1}')
-    time=$(echo "$result" | awk '{print $2}')
-    
-    if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then
-      is_faster=$(awk -v t1="$time" -v t2="$FASTEST_TIME" 'BEGIN {print (t1 < t2) ? 1 : 0}')
-      if [ "$is_faster" -eq 1 ]; then
-        FASTEST_TIME=$time
-        BEST_SNI=$domain
-      fi
+  # 替换为抗封锁、常态化的系统级网络连通性/CDN探测域名，避免主动探测封锁
+  SNI_CANDIDATES="www.msftconnecttest.com cp.cloudflare.com connectivitycheck.gstatic.com time.apple.com"
+  OPTIMIZED_SNI="www.msftconnecttest.com"
+  LOWEST_LATENCY=9999
+
+  echo -e "${YELLOW}正在测速并智能挑选抗封锁 SNI 域名...${PLAIN}"
+  for domain in $SNI_CANDIDATES; do
+    latency=$(curl -o /dev/null -s -w '%{time_connect}\n' --connect-timeout 2 -m 3 "https://$domain" 2>/dev/null || echo "999")
+    is_better=$(awk -v l="$latency" -v min="$LOWEST_LATENCY" 'BEGIN {if (l > 0 && l < min) print 1; else print 0}')
+    if [ "$is_better" = "1" ]; then
+      LOWEST_LATENCY=$latency
+      OPTIMIZED_SNI=$domain
     fi
   done
-
-  if [ -z "$BEST_SNI" ]; then
-    BEST_SNI="www.bing.com"
-    echo -e "${YELLOW}自动测速未返回有效结果，回退默认使用: ${BEST_SNI}${PLAIN}"
-  else
-    echo -e "${GREEN}✓ 自动优选成功！最佳 SNI: ${BEST_SNI} (响应耗时: ${FASTEST_TIME}s)${PLAIN}"
-  fi
+  echo -e "${GREEN}✔ 优选最佳抗封 SNI: ${OPTIMIZED_SNI} (耗时: ${LOWEST_LATENCY}s)${PLAIN}"
 fi
-
-RANDOM_SNI="$BEST_SNI"
 
 if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
   rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
   openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || openssl genrsa -out /etc/hysteria/key.key 2048 2>/dev/null
-  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${RANDOM_SNI}" -days 3650 2>/dev/null
+  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
   chmod 600 /etc/hysteria/key.key
 fi
 
-# 写入配置文件
+# 写入单端口监听配置文件
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${HY_PORT}
 
@@ -137,6 +138,7 @@ auth:
   type: password
   password: ${HY_PASS}
 
+# 流量混淆配置 (Karing完美适配)
 obfs:
   type: salamander
   salamander:
@@ -145,7 +147,7 @@ obfs:
 masquerade:
   type: proxy
   proxy:
-    url: https://${RANDOM_SNI}
+    url: https://${OPTIMIZED_SNI}
     rewriteHost: true
 
 tls:
@@ -153,14 +155,14 @@ tls:
   key: /etc/hysteria/key.key
 EOF
 
-# ===== [5/5] 服务配置 - Alpine OpenRC / Background 兼容 =====
-echo -e "${YELLOW}[5/5] 配置并启动服务...${PLAIN}"
+# ===== [5/5] 服务 - Alpine/Podman兼容 =====
+echo -e "${YELLOW}[5/5] 配置并启动单端口服务...${PLAIN}"
 
 cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
 #!/bin/sh
 pkill -f "hysteria.*config.yaml" || true
 sleep 1
-if command -v rc-service >/dev/null 2>&1 && rc-status --local 2>/dev/null | grep -q "hysteria"; then
+if command -v rc-service >/dev/null 2>&1 && rc-service hysteria status >/dev/null 2>&1; then
   rc-service hysteria restart
 else
   nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
@@ -168,49 +170,48 @@ fi
 RESTART
 chmod +x /usr/local/bin/hy2-restart.sh
 
-if [ -d /etc/init.d ] && command -v openrc >/dev/null 2>&1; then
-  cat > /etc/init.d/hysteria << 'INITEOF'
+if command -v openrc >/dev/null 2>&1 && [ -d /etc/init.d ]; then
+  cat > /etc/init.d/hysteria <<EOF
 #!/sbin/openrc-run
 
-name="hysteria"
-description="Hysteria2 Server (Karing Enhanced)"
+name="Hysteria2 Server"
+description="Hysteria2 Server (Single Port)"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml"
 command_background="yes"
 pidfile="/run/hysteria.pid"
 
 depend() {
-    need net
-    after firewall
+  use net
+  after firewall
 }
-INITEOF
+EOF
   chmod +x /etc/init.d/hysteria
-  rc-update add hysteria default 2>/dev/null || true
-  rc-service hysteria restart 2>/dev/null || rc-service hysteria start 2>/dev/null || true
+  rc-update add hysteria default >/dev/null 2>&1 || true
+  rc-service hysteria restart >/dev/null 2>&1 || rc-service hysteria start >/dev/null 2>&1 || true
 else
   pkill -f "hysteria.*config.yaml" 2>/dev/null || true
   sleep 1
   nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 fi
 
-# 输出 Karing 专用配置
 SERVER_IP=$CUSTOM_IP
 if [ -z "$SERVER_IP" ]; then
   SERVER_IP=$(curl -4s --max-time 5 api.ipify.org || curl -4s --max-time 5 ifconfig.me || echo "你的服务器IP")
 fi
 
 echo -e "\n${GREEN}================================================"
-echo -e "Hysteria 2 智能优选SNI防封锁节点部署成功！(Alpine版)"
+echo -e "Hysteria 2 单端口节点部署成功！(抗封锁防主动探测版)"
 echo -e "================================================${PLAIN}"
 echo -e "${CYAN}[Karing 客户端手动填入参数]:${PLAIN}"
 echo -e "  - ${YELLOW}服务器地址 (Address):${PLAIN} ${SERVER_IP}"
-echo -e "  - ${YELLOW}主端口 (Port):${PLAIN} ${HY_PORT} (请自行填写映射后的外网端口)"
+echo -e "  - ${YELLOW}端口 (Port):${PLAIN} ${HY_PORT}"
 echo -e "  - ${YELLOW}认证密码 (Password):${PLAIN} ${HY_PASS}"
 echo -e "  - ${YELLOW}混淆类型 (Obfs Type):${PLAIN} salamander"
-echo -e "  - ${YELLOW}混淆密码 (Obfs Password):${PLAIN} ${HY_OBFS_PASS}"
-echo -e "  - ${YELLOW}SNI / 伪装域名:${PLAIN} ${RANDOM_SNI}"
+echo -e "  - ${YELLOW}混的声音/混淆密码 (Obfs Password):${PLAIN} ${HY_OBFS_PASS}"
+echo -e "  - ${YELLOW}SNI / 伪装域名:${PLAIN} ${OPTIMIZED_SNI}"
 echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True)"
 echo -e "------------------------------------------------"
-echo -e "${CYAN}[标准 Hysteria2 节点链接]:${PLAIN}"
-echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
-echo -e "================================================"
+echo -e "${CYAN}[标准 Hysteria2 单端口节点链接]:${PLAIN}"
+echo -e "  hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?insecure=1&sni=${OPTIMIZED_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
+echo -e "================================================${PLAIN}"
