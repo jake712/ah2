@@ -1,7 +1,6 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 + AnyTLS Alpine 同端口极简全自动部署脚本
-# 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
+# Hysteria 2 + AnyTLS Alpine 同端口修复版全自动部署脚本
 # =========================================================================
 
 set -e
@@ -13,9 +12,9 @@ if [ "$(id -u)" != "0" ]; then
   exit 1 
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (同端口双协议) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (修复下载问题) ===${PLAIN}"
 
-# ===== [1/5] 基础环境与依赖 =====
+# ===== [1/5] 基础环境与依赖 (补全 unzip) =====
 echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
 if ! grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
   if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
@@ -29,11 +28,10 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 
 apk update -q
-apk add --no-cache curl openssl ca-certificates gawk iproute2
+apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
 
 # ===== [2/5] 自动生成统一端口与独立密钥 =====
 echo -e "${YELLOW}[2/5] 正在生成随机端口与安全密钥...${PLAIN}"
-# 统一监听端口 (TCP/UDP 共用)
 PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
 
 HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
@@ -64,30 +62,37 @@ DISGUISE_HY="systemd-timesyncd"
 mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
 chmod +x /usr/local/bin/$DISGUISE_HY
 
-# 2. 下载 AnyTLS
-ATLS_URL="https://github.com/anytls/anytls-go/releases/latest/download/anytls-linux-${ARCH_STR}"
-rm -f /tmp/anytls
-INSTALL_ATLS=0
-for url in "$ATLS_URL" "https://ghfast.top/$ATLS_URL"; do
-  if curl -fsSL --max-time 30 -o /tmp/anytls "$url"; then
-    INSTALL_ATLS=1
-    break
-  fi
-done
+# 2. 动态获取并下载 AnyTLS (修复 404)
+ATLS_API_URL="https://api.github.com/repos/anytls/anytls-go/releases/latest"
+ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
 
-if [ "$INSTALL_ATLS" = "1" ] && [ -s /tmp/anytls ]; then
-  DISGUISE_ATLS="systemd-networkd"
-  mv /tmp/anytls /usr/local/bin/$DISGUISE_ATLS
-  chmod +x /usr/local/bin/$DISGUISE_ATLS
-else
-  echo -e "${YELLOW}提示: AnyTLS 核心未下载成功，将仅部署 Hysteria 2${PLAIN}"
-  INSTALL_ATLS=0
+INSTALL_ATLS=0
+if [ -n "$ATLS_ZIP_URL" ]; then
+  rm -f /tmp/anytls.zip
+  for url in "$ATLS_ZIP_URL" "https://ghfast.top/$ATLS_ZIP_URL"; do
+    if curl -fsSL --max-time 30 -o /tmp/anytls.zip "$url"; then
+      break
+    fi
+  done
+  
+  if [ -s /tmp/anytls.zip ]; then
+    unzip -qo /tmp/anytls.zip -d /tmp/
+    ATLS_BIN=$(find /tmp -maxdepth 1 -type f \( -name "anytls-server" -o -name "anytls" \) | head -n 1)
+    if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
+      INSTALL_ATLS=1
+      DISGUISE_ATLS="systemd-networkd"
+      mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
+      chmod +x /usr/local/bin/$DISGUISE_ATLS
+    fi
+  fi
+fi
+
+if [ "$INSTALL_ATLS" != "1" ]; then
+  echo -e "${YELLOW}提示: AnyTLS 核心未能成功下载，将仅部署 Hysteria 2${PLAIN}"
 fi
 
 # ===== [4/5] 优选 SNI 与生成配置 =====
 echo -e "${YELLOW}[4/5] 智能优选 SNI 并生成证书与配置...${PLAIN}"
-
-# 简易测速优选 SNI
 SNI_CANDIDATES="www.bing.com www.apple.com www.cloudflare.com"
 OPTIMIZED_SNI="www.bing.com"
 LOWEST_LATENCY=9999
@@ -100,13 +105,11 @@ for domain in $SNI_CANDIDATES; do
   fi
 done
 
-# 生成自签名证书 (供双协议共用)
 rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
 openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null
 openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
 chmod 600 /etc/hysteria/key.key
 
-# 写入 Hysteria 2 配置 (UDP 监听 :PORT)
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${PORT}
 auth:
@@ -126,7 +129,6 @@ tls:
   key: /etc/hysteria/key.key
 EOF
 
-# 写入 AnyTLS 配置 (TCP 监听同端口 :PORT)
 if [ "$INSTALL_ATLS" = "1" ]; then
   cat > /etc/anytls/config.json <<EOF
 {
