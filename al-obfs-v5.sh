@@ -1,6 +1,7 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 + AnyTLS 同端口双协议部署脚本 (支持自定义参数版)
+# Hysteria 2 + AnyTLS Alpine 同端口终极完美版部署脚本
+# 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
 # =========================================================================
 
 set -e
@@ -16,7 +17,7 @@ while getopts "p:i:h" opt; do
     i) CUSTOM_IP=$OPTARG ;;
     h) 
       echo "用法: $0 [选项]"
-      echo "  -p <端口>   自定义监听端口"
+      echo "  -p <端口>   自定义监听端口 (默认随机高位端口)"
       echo "  -i <公网IP> 手动指定服务器公网 IP"
       exit 0 
       ;;
@@ -28,7 +29,7 @@ if [ "$(id -u)" != "0" ]; then
   exit 1 
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (支持自定义端口与IP) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (同端口双协议完美版) ===${PLAIN}"
 
 # ===== [1/5] 基础环境与依赖 =====
 echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
@@ -67,8 +68,8 @@ case "$ARCH" in
   *) ARCH_STR="amd64" ;;
 esac
 
-mkdir -p /etc/hysteria /etc/anytls /usr/local/bin /var/log
-chmod 700 /etc/hysteria /etc/anytls
+mkdir -p /etc/hysteria /usr/local/bin /var/log
+chmod 700 /etc/hysteria
 
 # ===== [3/5] 下载核心组件并伪装进程名 =====
 echo -e "${YELLOW}[3/5] 下载核心组件并进行特征伪装...${PLAIN}"
@@ -132,6 +133,7 @@ openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/de
 openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
 chmod 600 /etc/hysteria/key.key
 
+# 写入 Hysteria 2 YAML 配置
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${PORT}
 auth:
@@ -151,36 +153,28 @@ tls:
   key: /etc/hysteria/key.key
 EOF
 
-if [ "$INSTALL_ATLS" = "1" ]; then
-  cat > /etc/anytls/config.json <<EOF
-{
-  "listen": ":${PORT}",
-  "password": "${ATLS_PASS}",
-  "cert": "/etc/hysteria/cert.crt",
-  "key": "/etc/hysteria/key.key"
-}
-EOF
-fi
-
 # ===== [5/5] 启动服务与输出结果 =====
 echo -e "${YELLOW}[5/5] 启动服务进程...${PLAIN}"
 pkill -x "$DISGUISE_HY" 2>/dev/null || true
 [ "$INSTALL_ATLS" = "1" ] && { pkill -x "$DISGUISE_ATLS" 2>/dev/null || true; }
 sleep 1
 
+# 启动 Hysteria 2
 nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+
+# 启动 AnyTLS (使用正确的 -l 与 -p 命令行参数，无需配置文件)
 if [ "$INSTALL_ATLS" = "1" ]; then
-  nohup /usr/local/bin/$DISGUISE_ATLS -c /etc/anytls/config.json > /var/log/anytls.log 2>&1 &
+  nohup /usr/local/bin/$DISGUISE_ATLS -l ":${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
 fi
 
-# 获取公网 IP (优先使用用户指定的 IP)
+# 获取公网 IP
 SERVER_IP="$CUSTOM_IP"
 if [ -z "$SERVER_IP" ]; then
   SERVER_IP=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me || echo "YOUR_SERVER_IP")
 fi
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
-echo -e "${GREEN}🎉 同端口双协议部署成功！${PLAIN}"
+echo -e "${GREEN}🎉 同端口双协议完美版部署成功！${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e " 📍 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e " 🔢 共用监听端口 (Port)  : ${CYAN}${PORT} (TCP & UDP)${PLAIN}"
@@ -197,4 +191,8 @@ if [ "$INSTALL_ATLS" = "1" ]; then
 fi
 echo -e "${YELLOW}[Hysteria 2 直连链接]:${PLAIN}"
 echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${PORT}?insecure=1&sni=${OPTIMIZED_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}#Hy2-SharedPort${PLAIN}"
+if [ "$INSTALL_ATLS" = "1" ]; then
+  echo -e "\n${YELLOW}[AnyTLS 直连链接]:${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${SERVER_IP}:${PORT}?sni=${OPTIMIZED_SNI}&insecure=1#AnyTLS-SharedPort${PLAIN}"
+fi
 echo -e "${GREEN}================================================================${PLAIN}"
