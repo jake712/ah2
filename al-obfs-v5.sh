@@ -1,20 +1,36 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 + AnyTLS Alpine 同端口修复版全自动部署脚本
+# Hysteria 2 + AnyTLS 同端口双协议部署脚本 (支持自定义参数版)
 # =========================================================================
 
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
 
+CUSTOM_PORT=""
+CUSTOM_IP=""
+
+while getopts "p:i:h" opt; do
+  case $opt in
+    p) CUSTOM_PORT=$OPTARG ;;
+    i) CUSTOM_IP=$OPTARG ;;
+    h) 
+      echo "用法: $0 [选项]"
+      echo "  -p <端口>   自定义监听端口"
+      echo "  -i <公网IP> 手动指定服务器公网 IP"
+      exit 0 
+      ;;
+  esac
+done
+
 if [ "$(id -u)" != "0" ]; then 
   echo -e "${RED}错误: 请使用 root 权限运行此脚本！${PLAIN}"
   exit 1 
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (修复下载问题) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (支持自定义端口与IP) ===${PLAIN}"
 
-# ===== [1/5] 基础环境与依赖 (补全 unzip) =====
+# ===== [1/5] 基础环境与依赖 =====
 echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
 if ! grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
   if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
@@ -30,9 +46,15 @@ fi
 apk update -q
 apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
 
-# ===== [2/5] 自动生成统一端口与独立密钥 =====
-echo -e "${YELLOW}[2/5] 正在生成随机端口与安全密钥...${PLAIN}"
-PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
+# ===== [2/5] 端口与密钥初始化 =====
+echo -e "${YELLOW}[2/5] 正在初始化端口与安全密钥...${PLAIN}"
+if [ -n "$CUSTOM_PORT" ]; then
+  PORT=$CUSTOM_PORT
+  echo -e "${CYAN}✔ 使用用户指定的端口: ${PORT}${PLAIN}"
+else
+  PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
+  echo -e "${CYAN}✔ 未指定端口，已自动生成随机端口: ${PORT}${PLAIN}"
+fi
 
 HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
 HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
@@ -62,7 +84,7 @@ DISGUISE_HY="systemd-timesyncd"
 mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
 chmod +x /usr/local/bin/$DISGUISE_HY
 
-# 2. 动态获取并下载 AnyTLS (修复 404)
+# 2. 下载 AnyTLS
 ATLS_API_URL="https://api.github.com/repos/anytls/anytls-go/releases/latest"
 ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
 
@@ -151,7 +173,11 @@ if [ "$INSTALL_ATLS" = "1" ]; then
   nohup /usr/local/bin/$DISGUISE_ATLS -c /etc/anytls/config.json > /var/log/anytls.log 2>&1 &
 fi
 
-SERVER_IP=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me || echo "YOUR_SERVER_IP")
+# 获取公网 IP (优先使用用户指定的 IP)
+SERVER_IP="$CUSTOM_IP"
+if [ -z "$SERVER_IP" ]; then
+  SERVER_IP=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me || echo "YOUR_SERVER_IP")
+fi
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
 echo -e "${GREEN}🎉 同端口双协议部署成功！${PLAIN}"
