@@ -21,10 +21,7 @@ youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
 
 donate: https://jake712.com/?p=120
 
-Debian 一鍵安裝Hysteria 2,多端口防封鎖版
-```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfsm.sh | bash -s -- -p 端口開始-端口結束 -i 主機出口IP
-```
+
 如果不通可能沒安裝IP TABLE
 ```
 apt-get update && apt-get install -y iptables && systemctl restart hysteria
