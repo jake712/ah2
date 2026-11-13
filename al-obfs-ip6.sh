@@ -1,206 +1,227 @@
 #!/bin/sh
-# Hysteria 2 Alpine V1.2 - IPv4/IPv6 双栈单端口适配版
-# 适配: Alpine Linux 3.20/3.21/3.22+, Karing 客户端完美适配版
+# =========================================================================
+# Hysteria 2 + AnyTLS Alpine 同端口终极完美版部署脚本 (支持 IPv4/IPv6 双栈)
+# 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
+# =========================================================================
 
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
 
-while getopts "p:w:i:h" opt; do
+CUSTOM_PORT=""
+CUSTOM_IP=""
+
+while getopts "p:i:h" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
-    w) CUSTOM_PASSWORD=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) echo "用法: $0 [-p 端口,如 30000] [-w 认证密码] [-i 公网IP]"; exit 0 ;;
+    h) 
+      echo "用法: $0 [选项]"
+      echo "  -p <端口>      自定义监听端口 (默认随机高位端口)"
+      echo "  -i <IP/IPv6>   手动指定服务器公网 IP (支持 IPv4 或 IPv6 地址)"
+      exit 0 
+      ;;
   esac
 done
 
-if [ "$(id -u)" != "0" ]; then echo -e "${RED}请用 root 运行${PLAIN}"; exit 1; fi
+if [ "$(id -u)" != "0" ]; then 
+  echo -e "${RED}错误: 请使用 root 权限运行此脚本！${PLAIN}"
+  exit 1 
+fi
 
-echo -e "${GREEN}=== Hysteria2 Alpine V1.2 双栈单端口版 ===${PLAIN}"
-echo -e "容器ID: $(cat /etc/hostname 2>/dev/null || hostname) | 时间: $(date) | 系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2)"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (IPv4/IPv6 双栈同端口完美版) ===${PLAIN}"
 
-# ===== [1/5] 基础依赖 - Alpine适配 =====
-echo -e "${YELLOW}[1/5] 检查并安装 Alpine 依赖...${PLAIN}"
-
-if grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
-  echo -e "${YELLOW}检测到 Podman (dns.podman)，保留原有 DNS${PLAIN}"
-else
+# ===== [1/5] 基础环境与依赖 =====
+echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
+if ! grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
   if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
-    echo -e "${YELLOW}修复 DNS...${PLAIN}"
-    echo "nameserver 1.1.1.1" > /etc/resolv.conf
-    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-    echo "nameserver 2606:4700:4700::1111" >> /etc/resolv.conf
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111" > /etc/resolv.conf
   fi
 fi
 
 if ! command -v apk >/dev/null 2>&1; then
-  echo -e "${RED}未检测到 apk，不是 Alpine Linux 系统${PLAIN}"; exit 1
+  echo -e "${RED}错误: 未检测到 apk 包管理器，本脚本仅支持 Alpine Linux${PLAIN}"
+  exit 1
 fi
 
-echo -e "${YELLOW}更新 apk 软件源并安装必要工具...${PLAIN}"
 apk update -q
-apk add --no-cache curl openssl bind-tools iproute2 ca-certificates
+apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
 
-if [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
-  update-ca-certificates 2>/dev/null || true
-fi
-
-# ===== [2/5] 参数和端口初始化 =====
-echo -e "${YELLOW}[2/5] 初始化端口参数...${PLAIN}"
-HY_PORT=${CUSTOM_PORT:-30000}
-
-# 随机生成混淆密码和认证密码
-if command -v openssl >/dev/null 2>&1; then
-  HY_OBFS_PASS=$(openssl rand -base64 12 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 16)
-  [ -z "$CUSTOM_PASSWORD" ] && HY_PASS=$(openssl rand -base64 12 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 16)
+# ===== [2/5] 端口与密钥初始化 =====
+echo -e "${YELLOW}[2/5] 正在初始化端口与安全密钥...${PLAIN}"
+if [ -n "$CUSTOM_PORT" ]; then
+  PORT=$CUSTOM_PORT
+  echo -e "${CYAN}✔ 使用用户指定的端口: ${PORT}${PLAIN}"
 else
-  HY_OBFS_PASS=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 16)
-  [ -z "$CUSTOM_PASSWORD" ] && HY_PASS=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 16)
+  PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
+  echo -e "${CYAN}✔ 未指定端口，已自动生成随机端口: ${PORT}${PLAIN}"
 fi
-[ -n "$CUSTOM_PASSWORD" ] && HY_PASS=$CUSTOM_PASSWORD
-[ -z "$HY_PASS" ] && HY_PASS="Hy2Pass$(date +%s | tail -c 4)"
+
+HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+ATLS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
 
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64|amd64) HY_ARCH="amd64" ;;
-  aarch64|arm64) HY_ARCH="arm64" ;;
-  armv7l|arm) HY_ARCH="arm" ;;
-  *) HY_ARCH="amd64" ;;
+  x86_64|amd64) ARCH_STR="amd64" ;;
+  aarch64|arm64) ARCH_STR="arm64" ;;
+  *) ARCH_STR="amd64" ;;
 esac
 
 mkdir -p /etc/hysteria /usr/local/bin /var/log
-chmod 700 /etc/hysteria 2>/dev/null || true
+chmod 700 /etc/hysteria
 
-# ===== [3/5] 下载 Hysteria2 (支持双栈网络) =====
-echo -e "${YELLOW}[3/5] 下载 Hysteria2 ($HY_ARCH)...${PLAIN}"
-HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
+# ===== [3/5] 下载核心组件并伪装进程名 =====
+echo -e "${YELLOW}[3/5] 下载核心组件并进行特征伪装...${PLAIN}"
+
+# 1. 下载 Hysteria 2
+HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH_STR}"
 rm -f /tmp/hysteria
-download_ok=0
-for i in 1 2 3; do
-  if command -v curl >/dev/null 2>&1; then
-    # 去掉 -4，允许自动走 IPv4 或 IPv6 下载
-    if curl -fsSL --max-time 30 -o /tmp/hysteria "$HY_URL"; then download_ok=1; break; fi
+for url in "$HY_URL" "https://ghfast.top/$HY_URL"; do
+  curl -fsSL --max-time 30 -o /tmp/hysteria "$url" && break
+done
+[ ! -s /tmp/hysteria ] && { echo -e "${RED}错误: Hysteria 2 下载失败${PLAIN}"; exit 1; }
+DISGUISE_HY="systemd-timesyncd"
+mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
+chmod +x /usr/local/bin/$DISGUISE_HY
+
+# 2. 下载 AnyTLS
+ATLS_API_URL="https://api.github.com/repos/anytls/anytls-go/releases/latest"
+ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
+
+INSTALL_ATLS=0
+if [ -n "$ATLS_ZIP_URL" ]; then
+  rm -f /tmp/anytls.zip
+  for url in "$ATLS_ZIP_URL" "https://ghfast.top/$ATLS_ZIP_URL"; do
+    if curl -fsSL --max-time 30 -o /tmp/anytls.zip "$url"; then
+      break
+    fi
+  done
+  
+  if [ -s /tmp/anytls.zip ]; then
+    unzip -qo /tmp/anytls.zip -d /tmp/
+    ATLS_BIN=$(find /tmp -maxdepth 1 -type f \( -name "anytls-server" -o -name "anytls" \) | head -n 1)
+    if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
+      INSTALL_ATLS=1
+      DISGUISE_ATLS="systemd-networkd"
+      mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
+      chmod +x /usr/local/bin/$DISGUISE_ATLS
+    fi
   fi
-  sleep 1
+fi
+
+if [ "$INSTALL_ATLS" != "1" ]; then
+  echo -e "${YELLOW}提示: AnyTLS 核心未能成功下载，将仅部署 Hysteria 2${PLAIN}"
+fi
+
+# ===== [4/5] 优选 SNI 与生成配置 =====
+echo -e "${YELLOW}[4/5] 智能优选 SNI 并生成证书与配置...${PLAIN}"
+SNI_CANDIDATES="www.bing.com www.apple.com www.cloudflare.com"
+OPTIMIZED_SNI="www.bing.com"
+LOWEST_LATENCY=9999
+for domain in $SNI_CANDIDATES; do
+  latency=$(curl -o /dev/null -s -w '%{time_connect}\n' --connect-timeout 2 -m 3 "https://$domain" 2>/dev/null || echo "999")
+  is_better=$(awk -v l="$latency" -v min="$LOWEST_LATENCY" 'BEGIN {if (l > 0 && l < min) print 1; else print 0}')
+  if [ "$is_better" = "1" ]; then
+    LOWEST_LATENCY=$latency
+    OPTIMIZED_SNI=$domain
+  fi
 done
 
-if [ "$download_ok" != "1" ]; then
-  for mirror in "https://ghfast.top/https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"; do
-    curl -fsSL --max-time 30 -o /tmp/hysteria "$mirror" 2>/dev/null && download_ok=1 && break
-  done
-fi
+rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
+openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null
+openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
+chmod 600 /etc/hysteria/key.key
 
-if [ ! -s /tmp/hysteria ]; then echo -e "${RED}下载失败，请检查网络连接${PLAIN}"; exit 1; fi
-mv /tmp/hysteria /usr/local/bin/hysteria
-chmod +x /usr/local/bin/hysteria
-
-# ===== [4/5] 生成随机伪装证书和高级配置 =====
-echo -e "${YELLOW}[4/5] 生成单端口混淆配置（支持双栈监听）...${PLAIN}"
-
-RANDOM_SNI=$(awk 'BEGIN{
-  split("apple.com cloudflare.com icloud.com microsoft.com windows.com weather.com", a);
-  srand();
-  print a[int(rand()*length(a))+1]
-}')
-
-if [ ! -f /etc/hysteria/cert.crt ] || [ ! -f /etc/hysteria/key.key ]; then
-  rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
-  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null || openssl genrsa -out /etc/hysteria/key.key 2048 2>/dev/null
-  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${RANDOM_SNI}" -days 3650 2>/dev/null
-  chmod 600 /etc/hysteria/key.key
-fi
-
-# 使用 [::]:端口 以同时完美支持 IPv4 和 IPv6 监听
+# 写入 Hysteria 2 YAML 配置 (监听 `:${PORT}` 在 Linux 双栈环境下同时支持 IPv4 与 IPv6)
 cat > /etc/hysteria/config.yaml <<EOF
-listen: [::]:${HY_PORT}
-
+listen: :${PORT}
 auth:
   type: password
   password: ${HY_PASS}
-
-# 流量混淆配置 (Karing完美适配)
 obfs:
   type: salamander
   salamander:
     password: ${HY_OBFS_PASS}
-
 masquerade:
   type: proxy
   proxy:
-    url: https://${RANDOM_SNI}
+    url: https://${OPTIMIZED_SNI}
     rewriteHost: true
-
 tls:
   cert: /etc/hysteria/cert.crt
   key: /etc/hysteria/key.key
 EOF
 
-# ===== [5/5] 服务 - Alpine/Podman兼容 =====
-echo -e "${YELLOW}[5/5] 配置并启动单端口服务...${PLAIN}"
-
-cat > /usr/local/bin/hy2-restart.sh <<'RESTART'
-#!/bin/sh
-pkill -f "hysteria.*config.yaml" || true
+# ===== [5/5] 启动服务与输出结果 =====
+echo -e "${YELLOW}[5/5] 启动服务进程...${PLAIN}"
+pkill -x "$DISGUISE_HY" 2>/dev/null || true
+[ "$INSTALL_ATLS" = "1" ] && { pkill -x "$DISGUISE_ATLS" 2>/dev/null || true; }
 sleep 1
-if command -v rc-service >/dev/null 2>&1 && rc-service hysteria status >/dev/null 2>&1; then
-  rc-service hysteria restart
-else
-  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+
+# 启动 Hysteria 2
+nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+
+# 启动 AnyTLS
+if [ "$INSTALL_ATLS" = "1" ]; then
+  nohup /usr/local/bin/$DISGUISE_ATLS -l ":${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
 fi
-RESTART
-chmod +x /usr/local/bin/hy2-restart.sh
 
-if command -v openrc >/dev/null 2>&1 && [ -d /etc/init.d ]; then
-  cat > /etc/init.d/hysteria <<EOF
-#!/sbin/openrc-run
+# 获取公网 IP (支持 IPv4 与 IPv6 双栈自动检测)
+DETECTED_IPv4=""
+DETECTED_IPv6=""
 
-name="Hysteria2 Server"
-description="Hysteria2 Server (Single Port)"
-command="/usr/local/bin/hysteria"
-command_args="server -c /etc/hysteria/config.yaml"
-command_background="yes"
-pidfile="/run/hysteria.pid"
+if [ -n "$CUSTOM_IP" ]; then
+  # 用户手动指定了 IP
+  SERVER_IP="$CUSTOM_IP"
+else
+  # 自动检测 IPv4 和 IPv6
+  DETECTED_IPv4=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me 2>/dev/null || true)
+  DETECTED_IPv6=$(curl -6s --max-time 4 api6.ipify.org || curl -6s --max-time 4 ipv6.icanhazip.com 2>/dev/null || true)
+  
+  if [ -n "$DETECTED_IPv4" ]; then
+    SERVER_IP="$DETECTED_IPv4"
+  elif [ -n "$DETECTED_IPv6" ]; then
+    SERVER_IP="$DETECTED_IPv6"
+  else
+    SERVER_IP="YOUR_SERVER_IP"
+  fi
+fi
 
-depend() {
-  use net
-  after firewall
+# 判断当前显示和链接格式化（IPv6 需要加方括号 []）
+format_link_host() {
+  local ip="$1"
+  case "$ip" in
+    *:*) echo "[${ip}]" ;;
+    *) echo "$ip" ;;
+  esac
 }
-EOF
-  chmod +x /etc/init.d/hysteria
-  rc-update add hysteria default >/dev/null 2>&1 || true
-  rc-service hysteria restart >/dev/null 2>&1 || rc-service hysteria start >/dev/null 2>&1 || true
-else
-  pkill -f "hysteria.*config.yaml" 2>/dev/null || true
-  sleep 1
-  nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
-fi
 
-# 智能获取服务器 IP（优先支持自定义，其次自动识别 IPv4/IPv6）
-SERVER_IP=$CUSTOM_IP
-if [ -z "$SERVER_IP" ]; then
-  SERVER_IP=$(curl -s --max-time 4 api.ipify.org || curl -s --max-time 4 ifconfig.me || curl -6s --max-time 4 api6.ipify.org || curl -6s --max-time 4 ipv6.icanhazip.com || echo "你的服务器IP")
-fi
+LINK_HOST=$(format_link_host "$SERVER_IP")
 
-# 判断当前获取的 IP 是否为 IPv6 地址（包含冒号），如果是则在 URL 中加方括号
-if echo "$SERVER_IP" | grep -q ':'; then
-  URL_IP="[$SERVER_IP]"
-else
-  URL_IP="$SERVER_IP"
+echo -e "\n${GREEN}================================================================${PLAIN}"
+echo -e "${GREEN}🎉 同端口双协议完美版部署成功 (支持 IPv4/IPv6 双栈)！${PLAIN}"
+echo -e "${GREEN}================================================================${PLAIN}"
+echo -e " 📍 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
+if [ -n "$DETECTED_IPv6" ] && [ -z "$CUSTOM_IP" ]; then
+  echo -e " 🌐 检测到 IPv6 地址     : ${CYAN}${DETECTED_IPv6}${PLAIN}"
 fi
-
-echo -e "\n${GREEN}================================================"
-echo -e "Hysteria 2 单端口节点部署成功！(双栈 IPv4/IPv6 版)"
-echo -e "================================================${PLAIN}"
-echo -e "${CYAN}[Karing 客户端手动填入参数]:${PLAIN}"
-echo -e "  - ${YELLOW}服务器地址 (Address):${PLAIN} ${SERVER_IP}"
-echo -e "  - ${YELLOW}端口 (Port):${PLAIN} ${HY_PORT}"
-echo -e "  - ${YELLOW}认证密码 (Password):${PLAIN} ${HY_PASS}"
-echo -e "  - ${YELLOW}混淆类型 (Obfs Type):${PLAIN} salamander"
-echo -e "  - ${YELLOW}混淆密码 (Obfs Password):${PLAIN} ${HY_OBFS_PASS}"
-echo -e "  - ${YELLOW}SNI / 伪装域名:${PLAIN} ${RANDOM_SNI}"
-echo -e "  - ${YELLOW}允许跳过证书验证 (Insecure):${PLAIN} 开启 (True)"
-echo -e "------------------------------------------------"
-echo -e "${CYAN}[标准 Hysteria2 单端口节点链接]:${PLAIN}"
-echo -e "  hy2://${HY_PASS}@${URL_IP}:${HY_PORT}?insecure=1&sni=${RANDOM_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}"
-echo -e "================================================${PLAIN}"
+echo -e " 🔢 共用监听端口 (Port)  : ${CYAN}${PORT} (TCP & UDP)${PLAIN}"
+echo -e " 🌐 共享伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
+echo -e "----------------------------------------------------------------"
+echo -e " [1] Hysteria 2 配置信息"
+echo -e "   - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
+echo -e "   - 混淆密码 : ${CYAN}${HY_OBFS_PASS}${PLAIN}"
+echo -e "----------------------------------------------------------------"
+if [ "$INSTALL_ATLS" = "1" ]; then
+  echo -e " [2] AnyTLS 配置信息"
+  echo -e "   - 认证密码 : ${CYAN}${ATLS_PASS}${PLAIN}"
+  echo -e "----------------------------------------------------------------"
+fi
+echo -e "${YELLOW}[Hysteria 2 直连链接]:${PLAIN}"
+echo -e "${CYAN}hy2://${HY_PASS}@${LINK_HOST}:${PORT}?insecure=1&sni=${OPTIMIZED_SNI}&obfs=salamander&obfs-password=${HY_OBFS_PASS}#Hy2-SharedPort${PLAIN}"
+if [ "$INSTALL_ATLS" = "1" ]; then
+  echo -e "\n${YELLOW}[AnyTLS 直连链接]:${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${LINK_HOST}:${PORT}?sni=${OPTIMIZED_SNI}&insecure=1#AnyTLS-SharedPort${PLAIN}"
+fi
+echo -e "${GREEN}================================================================${PLAIN}"
