@@ -1,6 +1,6 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 + AnyTLS Alpine 同端口终极完美版部署脚本 (支持 IPv4/IPv6 双栈)
+# Hysteria 2 + AnyTLS Alpine 同端口终极完美版部署脚本 (完全支持 IPv6 双栈)
 # 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
 # =========================================================================
 
@@ -133,9 +133,9 @@ openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/de
 openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
 chmod 600 /etc/hysteria/key.key
 
-# 写入 Hysteria 2 YAML 配置 (监听 `:${PORT}` 在 Linux 双栈环境下同时支持 IPv4 与 IPv6)
+# 写入 Hysteria 2 YAML 配置 (强制双栈监听 `[::]:端口`)
 cat > /etc/hysteria/config.yaml <<EOF
-listen: :${PORT}
+listen: "[::]:${PORT}"
 auth:
   type: password
   password: ${HY_PASS}
@@ -162,33 +162,31 @@ sleep 1
 # 启动 Hysteria 2
 nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 
-# 启动 AnyTLS
+# 启动 AnyTLS (显式双栈监听 `[::]:端口`)
 if [ "$INSTALL_ATLS" = "1" ]; then
-  nohup /usr/local/bin/$DISGUISE_ATLS -l ":${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
+  nohup /usr/local/bin/$DISGUISE_ATLS -l "[::]:${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
 fi
 
-# 获取公网 IP (支持 IPv4 与 IPv6 双栈自动检测)
+# 获取公网 IP (优先检测 IPv6，其次 IPv4)
 DETECTED_IPv4=""
 DETECTED_IPv6=""
 
 if [ -n "$CUSTOM_IP" ]; then
-  # 用户手动指定了 IP
   SERVER_IP="$CUSTOM_IP"
 else
-  # 自动检测 IPv4 和 IPv6
-  DETECTED_IPv4=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me 2>/dev/null || true)
   DETECTED_IPv6=$(curl -6s --max-time 4 api6.ipify.org || curl -6s --max-time 4 ipv6.icanhazip.com 2>/dev/null || true)
+  DETECTED_IPv4=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me 2>/dev/null || true)
   
-  if [ -n "$DETECTED_IPv4" ]; then
-    SERVER_IP="$DETECTED_IPv4"
-  elif [ -n "$DETECTED_IPv6" ]; then
+  if [ -n "$DETECTED_IPv6" ]; then
     SERVER_IP="$DETECTED_IPv6"
+  elif [ -n "$DETECTED_IPv4" ]; then
+    SERVER_IP="$DETECTED_IPv4"
   else
     SERVER_IP="YOUR_SERVER_IP"
   fi
 fi
 
-# 判断当前显示和链接格式化（IPv6 需要加方括号 []）
+# 链接格式化（IPv6 自动加方括号 []）
 format_link_host() {
   local ip="$1"
   case "$ip" in
@@ -200,13 +198,13 @@ format_link_host() {
 LINK_HOST=$(format_link_host "$SERVER_IP")
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
-echo -e "${GREEN}🎉 同端口双协议完美版部署成功 (支持 IPv4/IPv6 双栈)！${PLAIN}"
+echo -e "${GREEN}🎉 同端口双协议完美版部署成功 (已强制启用 IPv6 双栈监听)！${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e " 📍 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
 if [ -n "$DETECTED_IPv6" ] && [ -z "$CUSTOM_IP" ]; then
   echo -e " 🌐 检测到 IPv6 地址     : ${CYAN}${DETECTED_IPv6}${PLAIN}"
 fi
-echo -e " 🔢 共用监听端口 (Port)  : ${CYAN}${PORT} (TCP & UDP)${PLAIN}"
+echo -e " 🔢 共用监听端口 (Port)  : ${CYAN}${PORT} (TCP & UDP 双栈)${PLAIN}"
 echo -e " 🌐 共享伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 echo -e " [1] Hysteria 2 配置信息"
