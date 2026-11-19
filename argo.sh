@@ -5,7 +5,7 @@
 #   特性：Vmess 经 Argo 隧道出网(TCP/443)
 #         Hysteria2 直连服务器 UDP 端口
 #         两者可共用「同一个端口号」(TCP / UDP 互不冲突)
-#         ✅ 支持指定服务器出口 IP（sendThrough / bindAddress）
+#         支持指定出口 IP 与端口
 #   环境：Alpine 3.16+ / OpenRC / x86_64 / aarch64
 #   用法：sh alpine-argo-hy2.sh [install|uninstall|info|restart] [选项]
 #=============================================================
@@ -36,8 +36,8 @@ DEF_SNI=www.bing.com
 DEF_NAME=Alpine-Argo
 
 ACTION=install
-OPT_PORT=""; OPT_VMESS_PORT=""; OPT_HY_PORT=""; OPT_UUID=""; OPT_SNI=""; OPT_NAME=""
-OPT_OUT_IP=""      # 新增：出口 IP
+OPT_PORT=""; OPT_VMESS_PORT=""; OPT_HY_PORT=""; OPT_OUT_IP=""
+OPT_UUID=""; OPT_SNI=""; OPT_NAME=""
 
 usage(){
 cat <<'EOF'
@@ -50,22 +50,19 @@ cat <<'EOF'
   restart     重启全部服务
 
 选项:
-  -p, --port N         同时指定 Vmess 与 Hysteria2 的端口号 (默认 8443)
-      --vmess-port N   单独指定 Vmess(本地 TCP)端口
-      --hy2-port N     单独指定 Hysteria2(UDP)端口
-  -u, --uuid UUID      指定 Vmess UUID
-      --sni NAME       指定 Hysteria2 自签证书的 SNI/CN (默认 www.bing.com)
-  -n, --name NAME      节点显示名称
-      --out-ip IP      指定服务器出口 IP（Xray sendThrough / Hysteria2 bindAddress）
-                       该 IP 需已绑定在本机网卡上，例如多 IP 机器
-  -h, --help           显示本帮助
+  -p, --port N          同时指定 Vmess 与 Hysteria2 的端口号 (默认 8443)
+      --vmess-port N    单独指定 Vmess(本地 TCP)端口
+      --hy2-port N      单独指定 Hysteria2(UDP)端口
+  -i, --out-ip IP       指定 Xray 与 Hysteria2 出口 IP (留空则自动/默认路由)
+  -u, --uuid UUID       指定 Vmess UUID
+      --sni NAME        指定 Hysteria2 自签证书的 SNI/CN (默认 www.bing.com)
+  -n, --name NAME       节点显示名称
+  -h, --help            显示本帮助
 
 示例:
-  sh alpine-argo-hy2.sh                       # 默认 8443 同端口
-  sh alpine-argo-hy2.sh -p 2087               # 双协议都用 2087
-  sh alpine-argo-hy2.sh --hy2-port 443        # 仅 hy2 用 443，vmess 用 8443
-  sh alpine-argo-hy2.sh --out-ip 203.0.113.5  # 指定出口 IP
-  sh alpine-argo-hy2.sh restart --out-ip 203.0.113.5   # 重启并切换出口 IP
+  sh alpine-argo-hy2.sh                              # 默认 8443 同端口
+  sh alpine-argo-hy2.sh -p 2087 -i 203.0.113.10      # 端口 2087，出口 IP 203.0.113.10
+  sh alpine-argo-hy2.sh --hy2-port 443 --out-ip 2001:db8::10
 EOF
 }
 
@@ -87,14 +84,39 @@ check_port(){
   [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-# 简单校验 IP：IPv4 点分 / IPv6 含冒号
+is_ipv6(){
+  case "$1" in *:*) return 0 ;; *) return 1 ;; esac
+}
+
 check_ip(){
-  case "$1" in
-    *[!0-9a-fA-F:.]*) return 1 ;;   # 含非法字符
-    *:*) return 0 ;;                # 含冒号，视为 IPv6
-    *.*.*.*) return 0 ;;            # IPv4
-    *) return 1 ;;
-  esac
+  ip="$1"
+  [ -n "$ip" ] || return 1
+  if is_ipv6 "$ip"; then
+    case "$ip" in *[!0-9a-fA-F:]*|:::*|*:::*) return 1 ;; esac
+    return 0
+  fi
+  # 简单校验 IPv4 四段 0-255
+  IFS=. read -r o1 o2 o3 o4 rest <<EOF
+$ip
+EOF
+  [ -z "$rest" ] && [ -n "$o4" ] || return 1
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    case "$o" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
+  done
+  return 0
+}
+
+format_host_for_url(){
+  h="$1"
+  if is_ipv6 "$h"; then
+    case "$h" in
+      \[*\]) printf '%s' "$h" ;;
+      *)     printf '[%s]' "$h" ;;
+    esac
+  else
+    printf '%s' "$h"
+  fi
 }
 
 need_root(){
@@ -117,24 +139,24 @@ do_install(){
     *) die "不支援的 CPU 架构: $(uname -m)" ;;
   esac
 
-  # 读取旧状态（保留 UUID/密码/路径/出口IP），再套用命令行参数
-  PORT=""; VMESS_PORT=""; HY_PORT=""; UUID=""; WSPATH=""; HYPASS=""; SNI=""; NAME=""; ARGO_HOST=""; OUT_IP=""
+  # 读取旧状态（保留 UUID/密码/路径），再套用命令行参数
+  PORT=""; VMESS_PORT=""; HY_PORT=""; OUT_IP=""; UUID=""; WSPATH=""; HYPASS=""; SNI=""; NAME=""; ARGO_HOST=""
   [ -f "$STATE" ] && . "$STATE"
   PORT=${OPT_PORT:-${PORT:-$DEF_PORT}}
   VMESS_PORT=${OPT_VMESS_PORT:-${VMESS_PORT:-$PORT}}
   HY_PORT=${OPT_HY_PORT:-${HY_PORT:-$PORT}}
+  OUT_IP=${OPT_OUT_IP:-${OUT_IP:-}}
   SNI=${OPT_SNI:-${SNI:-$DEF_SNI}}
   NAME=${OPT_NAME:-${NAME:-$DEF_NAME}}
   UUID=${OPT_UUID:-${UUID:-$(gen_uuid)}}
   WSPATH=${WSPATH:-/$(rand_hex 6)}
   HYPASS=${HYPASS:-$(rand_hex 8)}
-  OUT_IP=${OPT_OUT_IP:-${OUT_IP:-}}       # 出口 IP（可选）
 
   check_port "$PORT"       || die "端口无效: $PORT"
   check_port "$VMESS_PORT" || die "Vmess 端口无效: $VMESS_PORT"
   check_port "$HY_PORT"    || die "Hysteria2 端口无效: $HY_PORT"
   if [ -n "$OUT_IP" ]; then
-    check_ip "$OUT_IP" || die "出口 IP 格式无效: $OUT_IP"
+    check_ip "$OUT_IP" || die "出口 IP 无效: $OUT_IP"
   fi
 
   info "安装依赖 (curl unzip openssl ca-certificates) ..."
@@ -175,24 +197,20 @@ do_install(){
       || die "证书生成失败"
   fi
 
-  # --- 根据 OUT_IP 生成出站相关片段 ---
+  # Xray 出站：若指定 OUT_IP 则设置 sendThrough
   if [ -n "$OUT_IP" ]; then
-    XRAY_SEND=", \"sendThrough\": \"${OUT_IP}\""
-    HY_OUTBOUND="
-outbounds:
-  - name: direct
-    type: direct
-    direct:
-      mode: auto
-      bindAddress: ${OUT_IP}
-"
-    info "出口 IP 已指定: ${OUT_IP}"
+    XRAY_OUT_BLOCK=$(cat <<EOF
+{ "tag": "direct", "protocol": "freedom", "sendThrough": "${OUT_IP}", "settings": {} }
+EOF
+)
   else
-    XRAY_SEND=""
-    HY_OUTBOUND=""
+    XRAY_OUT_BLOCK=$(cat <<EOF
+{ "tag": "direct", "protocol": "freedom", "settings": {} }
+EOF
+)
   fi
 
-  info "写入 Xray 配置 ..."
+  info "写入 Xray 配置 (监听 127.0.0.1:${VMESS_PORT}${OUT_IP:+, 出口 IP: ${OUT_IP}}) ..."
   cat > "$XRAY_CFG" <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -213,16 +231,39 @@ outbounds:
     }
   ],
   "outbounds": [
-    {
-      "tag": "direct",
-      "protocol": "freedom",
-      "settings": { "domainStrategy": "UseIP"${XRAY_SEND} }
-    }
+    ${XRAY_OUT_BLOCK}
   ]
 }
 EOF
 
-  info "写入 Hysteria2 配置 ..."
+  # Hysteria2 出站：若指定 OUT_IP 则按 IPv4/IPv6 绑定 bindIP / bindIPv6
+  if [ -n "$OUT_IP" ]; then
+    if is_ipv6 "$OUT_IP"; then
+      HY_OUT_BLOCK=$(cat <<EOF
+outbounds:
+  - name: default
+    type: direct
+    direct:
+      mode: auto
+      bindIPv6: ${OUT_IP}
+EOF
+)
+    else
+      HY_OUT_BLOCK=$(cat <<EOF
+outbounds:
+  - name: default
+    type: direct
+    direct:
+      mode: auto
+      bindIP: ${OUT_IP}
+EOF
+)
+    fi
+  else
+    HY_OUT_BLOCK=""
+  fi
+
+  info "写入 Hysteria2 配置 (端口 :${HY_PORT}${OUT_IP:+, 出口 IP: ${OUT_IP}}) ..."
   cat > "$HY_CFG" <<EOF
 listen: :${HY_PORT}
 
@@ -233,7 +274,7 @@ tls:
 auth:
   type: password
   password: ${HYPASS}
-${HY_OUTBOUND}
+${HY_OUT_BLOCK}
 EOF
 
   info "写入 OpenRC 服务 ..."
@@ -302,13 +343,13 @@ EOF
 PORT=${PORT}
 VMESS_PORT=${VMESS_PORT}
 HY_PORT=${HY_PORT}
+OUT_IP=${OUT_IP}
 UUID=${UUID}
 WSPATH=${WSPATH}
 HYPASS=${HYPASS}
 SNI=${SNI}
 NAME=${NAME}
 ARGO_HOST=${ARGO_HOST}
-OUT_IP=${OUT_IP}
 EOF
   chmod 600 "$STATE"
 
@@ -318,21 +359,26 @@ EOF
 # ---------- 输出结果 ----------
 print_result(){
   [ -f "$STATE" ] || die "尚未安装，找不到 $STATE （请先运行 install）"
+  OUT_IP=""
   . "$STATE"
-  OUT_IP="${OUT_IP:-}"
 
   h=$(argo_host_from_log); [ -n "$h" ] && ARGO_HOST="$h"
 
-  IP=$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)
-  [ -z "${IP:-}" ] && IP=$(curl -fsS --max-time 8 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\n')
-  [ -z "${IP:-}" ] && IP="<服务器公网IP>"
+  if [ -n "${OUT_IP:-}" ]; then
+    IP="$OUT_IP"
+  else
+    IP=$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)
+    [ -z "${IP:-}" ] && IP=$(curl -fsS --max-time 8 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\n')
+    [ -z "${IP:-}" ] && IP="<服务器公网IP>"
+  fi
 
+  url_host=$(format_host_for_url "$IP")
   vmess_host=${ARGO_HOST:-"<等待Argo域名>"}
 
   vjson=$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","alpn":"","fp":""}' \
     "$NAME" "$vmess_host" "$UUID" "$vmess_host" "$WSPATH" "$vmess_host")
   vlink="vmess://$(printf %s "$vjson" | base64 | tr -d '\n')"
-  hlink="hysteria2://${HYPASS}@${IP}:${HY_PORT}/?sni=${SNI}&insecure=1#${NAME}-hy2"
+  hlink="hysteria2://${HYPASS}@${url_host}:${HY_PORT}/?sni=${SNI}&insecure=1#${NAME}-hy2"
 
   echo
   printf "${C}==================== 安装完成 ====================${N}\n"
@@ -342,6 +388,7 @@ print_result(){
   printf "${G}【Hysteria2 (直连 UDP)】${N}\n"
   printf '  %s\n\n' "$hlink"
   printf "${Y}---------- 手动填写参数 ----------${N}\n"
+  printf '  出口 IP    : %s\n'  "${OUT_IP:-自动/默认路由}"
   printf '  Vmess Host : %s\n'  "$vmess_host"
   printf '  Vmess Port : 443  (TLS)\n'
   printf '  Vmess UUID : %s\n'  "$UUID"
@@ -350,11 +397,6 @@ print_result(){
   printf '  HY2 端口   : %s  (UDP)\n' "$HY_PORT"
   printf '  HY2 密码   : %s\n'  "$HYPASS"
   printf '  HY2 SNI    : %s  (需跳过证书验证 insecure=1)\n' "$SNI"
-  if [ -n "$OUT_IP" ]; then
-    printf '  出口 IP    : %s  (Xray sendThrough / HY2 bindAddress)\n' "$OUT_IP"
-  else
-    printf '  出口 IP    : 未指定（默认按路由自动选择源地址）\n'
-  fi
   echo
   printf "${Y}---------- 服务状态 ----------${N}\n"
   for s in xray hysteria cloudflared; do
@@ -364,9 +406,6 @@ print_result(){
   warn "Argo 临时隧道域名每次重启都会改变，Vmess 链接会失效，重启后请运行 info 重新获取。"
   warn "Hysteria2 使用自签证书，客户端必须开启「跳过证书验证 / insecure」。"
   warn "请确认防火墙与云厂商安全组已放行 UDP ${HY_PORT}。"
-  if [ -n "$OUT_IP" ]; then
-    warn "出口 IP ${OUT_IP} 必须已绑定在本机网卡上，否则服务会启动失败。"
-  fi
   echo
 }
 
@@ -388,60 +427,6 @@ do_uninstall(){
 # ---------- 重启 ----------
 do_restart(){
   need_root
-
-  # 允许 restart 时用 --out-ip 改出口 IP（重写 Xray/Hysteria 配置）
-  if [ -n "${OPT_OUT_IP:-}" ]; then
-    check_ip "$OPT_OUT_IP" || die "出口 IP 格式无效: $OPT_OUT_IP"
-    [ -f "$STATE" ] || die "尚未安装，无法修改出口 IP"
-    . "$STATE"
-    OUT_IP="$OPT_OUT_IP"
-    if [ -n "$OUT_IP" ]; then
-      XRAY_SEND=", \"sendThrough\": \"${OUT_IP}\""
-      HY_OUTBOUND="
-outbounds:
-  - name: direct
-    type: direct
-    direct:
-      mode: auto
-      bindAddress: ${OUT_IP}
-"
-    else
-      XRAY_SEND=""; HY_OUTBOUND=""
-    fi
-    # 重写 Xray outbounds（只替换 outbounds 段，保持 inbound 不变）
-    python3 - "$XRAY_CFG" "$OUT_IP" <<'PY' 2>/dev/null || true
-import json,sys
-p,ip=sys.argv[1],sys.argv[2]
-d=json.load(open(p))
-for o in d.get("outbounds",[]):
-    if o.get("tag")=="direct" and o.get("protocol")=="freedom":
-        s=o.setdefault("settings",{})
-        s["domainStrategy"]="UseIP"
-        if ip: s["sendThrough"]=ip
-        else: s.pop("sendThrough",None)
-json.dump(d,open(p,"w"),indent=2)
-PY
-    # 重写 Hysteria outbounds
-    if [ -n "$OUT_IP" ]; then
-      # 删除旧 outbounds 段后追加新段
-      awk 'BEGIN{skip=0} /^outbounds:/{skip=1;next} skip==1 && /^[^[:space:]]/{skip=0} {if(!skip)print}' "$HY_CFG" > "$HY_CFG.tmp" || true
-      cat >> "$HY_CFG.tmp" <<EOF
-${HY_OUTBOUND}
-EOF
-      mv "$HY_CFG.tmp" "$HY_CFG"
-    else
-      awk 'BEGIN{skip=0} /^outbounds:/{skip=1;next} skip==1 && /^[^[:space:]]/{skip=0} {if(!skip)print}' "$HY_CFG" > "$HY_CFG.tmp" || true
-      mv "$HY_CFG.tmp" "$HY_CFG"
-    fi
-    # 更新 state
-    if grep -q '^OUT_IP=' "$STATE"; then
-      sed -i "s#^OUT_IP=.*#OUT_IP=${OUT_IP}#" "$STATE"
-    else
-      echo "OUT_IP=${OUT_IP}" >> "$STATE"
-    fi
-    info "出口 IP 已更新为: ${OUT_IP:-<自动>}"
-  fi
-
   info "重启服务 ..."
   rc-service xray restart >/dev/null 2>&1 || warn "xray 重启失败"
   rc-service hysteria restart >/dev/null 2>&1 || warn "hysteria 重启失败"
@@ -461,12 +446,19 @@ while [ $# -gt 0 ]; do
   case "$1" in
     install|uninstall|info|restart) ACTION="$1"; shift ;;
     -p|--port)        [ $# -ge 2 ] || die "$1 缺少参数"; OPT_PORT=$2; shift 2 ;;
+    --port=*)         OPT_PORT=${1#*=}; shift ;;
     --vmess-port)     [ $# -ge 2 ] || die "$1 缺少参数"; OPT_VMESS_PORT=$2; shift 2 ;;
+    --vmess-port=*)   OPT_VMESS_PORT=${1#*=}; shift ;;
     --hy2-port|--hy-port) [ $# -ge 2 ] || die "$1 缺少参数"; OPT_HY_PORT=$2; shift 2 ;;
+    --hy2-port=*|--hy-port=*) OPT_HY_PORT=${1#*=}; shift ;;
+    -i|--out-ip)      [ $# -ge 2 ] || die "$1 缺少参数"; OPT_OUT_IP=$2; shift 2 ;;
+    --out-ip=*)       OPT_OUT_IP=${1#*=}; shift ;;
     -u|--uuid)        [ $# -ge 2 ] || die "$1 缺少参数"; OPT_UUID=$2; shift 2 ;;
+    --uuid=*)         OPT_UUID=${1#*=}; shift ;;
     --sni)            [ $# -ge 2 ] || die "$1 缺少参数"; OPT_SNI=$2; shift 2 ;;
+    --sni=*)          OPT_SNI=${1#*=}; shift ;;
     -n|--name)        [ $# -ge 2 ] || die "$1 缺少参数"; OPT_NAME=$2; shift 2 ;;
-    --out-ip|--bind-ip) [ $# -ge 2 ] || die "$1 缺少参数"; OPT_OUT_IP=$2; shift 2 ;;
+    --name=*)         OPT_NAME=${1#*=}; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) die "未知参数: $1 （使用 --help 查看说明）" ;;
   esac
@@ -479,4 +471,3 @@ case "$ACTION" in
   restart)   do_restart ;;
   *) usage ;;
 esac
-# wget -qO- https://raw.githubusercontent.com/USER/REPO/main/alpine-argo-hy2.sh | sh -s -- -p 8443
