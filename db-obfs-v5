@@ -15,18 +15,18 @@ while getopts "p:i:h" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) 
+    h)
       echo "用法: $0 [选项]"
       echo "  -p <端口>   自定义监听端口 (默认随机高位端口)"
       echo "  -i <公网IP> 手动指定服务器公网 IP"
-      exit 0 
+      exit 0
       ;;
   esac
 done
 
-if [ "$(id -u)" != "0" ]; then 
+if [ "$(id -u)" != "0" ]; then
   echo -e "${RED}错误: 请使用 root 权限运行此脚本！${PLAIN}"
-  exit 1 
+  exit 1
 fi
 
 echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (Debian 同端口双协议完美版) ===${PLAIN}"
@@ -76,38 +76,56 @@ echo -e "${YELLOW}[3/5] 下载核心组件并进行特征伪装...${PLAIN}"
 # 1. 下载 Hysteria 2
 HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH_STR}"
 rm -f /tmp/hysteria
-for url in "$HY_URL" "https://ghfast.top/$HY_URL"; do
-  curl -fsSL --max-time 30 -o /tmp/hysteria "$url" && break
+for url in "$HY_URL" "https://ghfast.top/$HY_URL" "https://mirror.ghproxy.com/$HY_URL"; do
+  curl -fsSL --connect-timeout 15 --max-time 90 -o /tmp/hysteria "$url" && break
 done
 [ ! -s /tmp/hysteria ] && { echo -e "${RED}错误: Hysteria 2 下载失败${PLAIN}"; exit 1; }
 DISGUISE_HY="systemd-timesyncd"
 mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
 chmod +x /usr/local/bin/$DISGUISE_HY
 
-# 2. 下载 AnyTLS
+# 2. 下载 AnyTLS（兼容 API 解析失败时的直连兜底与多级镜像）
 ATLS_API_URL="https://api.github.com/repos/anytls/anytls-go/releases/latest"
-ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
+ATLS_JSON=$(curl -fsSL --connect-timeout 10 --max-time 20 "$ATLS_API_URL" 2>/dev/null || true)
+
+ATLS_TAG=""
+if [ -n "$ATLS_JSON" ]; then
+  ATLS_TAG=$(printf '%s\n' "$ATLS_JSON" | grep '"tag_name"' | head -n 1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+  ATLS_ZIP_URL=$(printf '%s\n' "$ATLS_JSON" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
+fi
+
+if [ -z "$ATLS_ZIP_URL" ]; then
+  TAG_USE="${ATLS_TAG:-v0.0.13}"
+  VER_NUM="${TAG_USE#v}"
+  ATLS_ZIP_URL="https://github.com/anytls/anytls-go/releases/download/${TAG_USE}/anytls_${VER_NUM}_linux_${ARCH_STR}.zip"
+fi
 
 INSTALL_ATLS=0
-if [ -n "$ATLS_ZIP_URL" ]; then
-  rm -f /tmp/anytls.zip
-  for url in "$ATLS_ZIP_URL" "https://ghfast.top/$ATLS_ZIP_URL"; do
-    if curl -fsSL --max-time 30 -o /tmp/anytls.zip "$url"; then
+rm -rf /tmp/anytls_extract /tmp/anytls.zip
+mkdir -p /tmp/anytls_extract
+
+for url in "$ATLS_ZIP_URL" "https://ghfast.top/$ATLS_ZIP_URL" "https://mirror.ghproxy.com/$ATLS_ZIP_URL"; do
+  if curl -fsSL --connect-timeout 15 --max-time 90 -o /tmp/anytls.zip "$url"; then
+    if unzip -tq /tmp/anytls.zip >/dev/null 2>&1; then
       break
-    fi
-  done
-  
-  if [ -s /tmp/anytls.zip ]; then
-    unzip -qo /tmp/anytls.zip -d /tmp/
-    ATLS_BIN=$(find /tmp -maxdepth 1 -type f \( -name "anytls-server" -o -name "anytls" \) | head -n 1)
-    if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
-      INSTALL_ATLS=1
-      DISGUISE_ATLS="systemd-networkd"
-      mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
-      chmod +x /usr/local/bin/$DISGUISE_ATLS
+    else
+      rm -f /tmp/anytls.zip
     fi
   fi
+done
+
+if [ -s /tmp/anytls.zip ] && unzip -qo /tmp/anytls.zip -d /tmp/anytls_extract; then
+  ATLS_BIN=$(find /tmp/anytls_extract -type f \( -name "anytls-server" -o -name "anytls" -o -name "*anytls*" \) ! -name "*.zip" | head -n 1)
+  if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
+    INSTALL_ATLS=1
+    DISGUISE_ATLS="systemd-networkd"
+    mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
+    chmod +x /usr/local/bin/$DISGUISE_ATLS
+    echo -e "${CYAN}✔ AnyTLS 核心已就绪${PLAIN}"
+  fi
 fi
+
+rm -rf /tmp/anytls_extract /tmp/anytls.zip
 
 if [ "$INSTALL_ATLS" != "1" ]; then
   echo -e "${YELLOW}提示: AnyTLS 核心未能成功下载，将仅部署 Hysteria 2${PLAIN}"
@@ -155,15 +173,26 @@ EOF
 # ===== [5/5] 启动服务与输出结果 =====
 echo -e "${YELLOW}[5/5] 启动服务进程...${PLAIN}"
 pkill -x "$DISGUISE_HY" 2>/dev/null || true
-[ "$INSTALL_ATLS" = "1" ] && { pkill -x "$DISGUISE_ATLS" 2>/dev/null || true; }
+[ -n "$DISGUISE_ATLS" ] && { pkill -x "$DISGUISE_ATLS" 2>/dev/null || true; }
 sleep 1
 
 # 启动 Hysteria 2
 nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 
-# 启动 AnyTLS
+# 启动 AnyTLS（若支援憑證旗標則帶入，否則使用基礎參數）
 if [ "$INSTALL_ATLS" = "1" ]; then
-  nohup /usr/local/bin/$DISGUISE_ATLS -l ":${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
+  ATLS_HELP=$(/usr/local/bin/$DISGUISE_ATLS -h 2>&1 || true)
+  ATLS_EXTRA_ARGS=""
+  if echo "$ATLS_HELP" | grep -q -- "-c\|--cert"; then
+    if echo "$ATLS_HELP" | grep -q -- "-k\|--key"; then
+      ATLS_EXTRA_ARGS="-c /etc/hysteria/cert.crt -k /etc/hysteria/key.key"
+    fi
+  fi
+  nohup /usr/local/bin/$DISGUISE_ATLS -l ":${PORT}" -p "${ATLS_PASS}" $ATLS_EXTRA_ARGS > /var/log/anytls.log 2>&1 &
+  sleep 1
+  if ! pgrep -x "$DISGUISE_ATLS" >/dev/null 2>&1; then
+    echo -e "${YELLOW}提示: AnyTLS 進程未常駐，請查看 /var/log/anytls.log 排查${PLAIN}"
+  fi
 fi
 
 # 获取公网 IP
