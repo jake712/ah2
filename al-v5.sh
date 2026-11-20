@@ -76,7 +76,7 @@ chmod 700 /etc/hysteria
 # ===== [3/5] 下载核心组件并伪装进程名 =====
 echo -e "${YELLOW}[3/5] 下载核心组件并进行特征伪装...${PLAIN}"
 
-# 1. 下载 Hysteria 2
+# 1. 下载 Hysteria 2 (修复变量拼接格式)
 HY_URL="https://github.com{ARCH_STR}"
 rm -f /tmp/hysteria
 for url in "$HY_URL" "https://ghfast.top"; do
@@ -87,28 +87,30 @@ DISGUISE_HY="systemd-timesyncd"
 mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
 chmod +x /usr/local/bin/$DISGUISE_HY
 
-# 2. 下载 AnyTLS
+# 2. 下载 AnyTLS (修复 grep 匹配与增加保底直连地址)
 ATLS_API_URL="https://github.com"
-ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
+ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url" | grep "linux_${ARCH_STR}.zip" | cut -d '"' -f 4 | head -n 1)
+
+if [ -z "$ATLS_ZIP_URL" ]; then
+  ATLS_ZIP_URL="https://github.com{ARCH_STR}.zip"
+fi
 
 INSTALL_ATLS=0
-if [ -n "$ATLS_ZIP_URL" ]; then
-  rm -f /tmp/anytls.zip
-  for url in "$ATLS_ZIP_URL" "https://ghfast.top"; do
-    if curl -fsSL --max-time 30 -o /tmp/anytls.zip "$url"; then
-      break
-    fi
-  done
-  
-  if [ -s /tmp/anytls.zip ]; then
-    unzip -qo /tmp/anytls.zip -d /tmp/
-    ATLS_BIN=$(find /tmp -maxdepth 1 -type f \( -name "anytls-server" -o -name "anytls" \) | head -n 1)
-    if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
-      INSTALL_ATLS=1
-      DISGUISE_ATLS="systemd-networkd"
-      mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
-      chmod +x /usr/local/bin/$DISGUISE_ATLS
-    fi
+rm -f /tmp/anytls.zip
+for url in "$ATLS_ZIP_URL" "https://ghfast.top"; do
+  if curl -fsSL --max-time 30 -o /tmp/anytls.zip "$url"; then
+    break
+  fi
+done
+
+if [ -s /tmp/anytls.zip ]; then
+  unzip -qo /tmp/anytls.zip -d /tmp/
+  ATLS_BIN=$(find /tmp -maxdepth 1 -type f \( -name "anytls-server" -o -name "anytls" \) | head -n 1)
+  if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
+    INSTALL_ATLS=1
+    DISGUISE_ATLS="systemd-networkd"
+    mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
+    chmod +x /usr/local/bin/$DISGUISE_ATLS
   fi
 fi
 
@@ -182,12 +184,12 @@ echo -e " 📍 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e " 🌐 共享伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 if [ "$INSTALL_ATLS" = "1" ]; then
-  echo -e " [1] AnyTLS 配置信息 (起始端口)"
+  echo -e " AnyTLS 配置信息 (起始端口)"
   echo -e "   - 监听端口 : ${CYAN}${ATLS_PORT} (TCP)${PLAIN}"
   echo -e "   - 认证密码 : ${CYAN}${ATLS_PASS}${PLAIN}"
   echo -e "----------------------------------------------------------------"
 fi
-echo -e " [2] Hysteria 2 配置信息 (顺延端口)"
+echo -e " Hysteria 2 配置信息 (顺延端口)"
 echo -e "   - 监听端口 : ${CYAN}${HY_PORT} (UDP)${PLAIN}"
 echo -e "   - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
 echo -e "   - 混淆密码 : ${CYAN}${HY_OBFS_PASS}${PLAIN}"
