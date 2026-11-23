@@ -3,9 +3,10 @@
 
 主機IP 
 
-SSH的IP
+SSH的IP 
 
-v2n core核心要改為sing_box 
+*** v2n core核心要改為sing_box 
+*** karing  打開設定 > TLS > 跳動證書驗證 打開
 
 Alpine 一鍵安裝Hysteria 2 + AnyTls單端口穩定版(65M Ram可用)
 ```
