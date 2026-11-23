@@ -45,7 +45,7 @@ if ! command -v apk >/dev/null 2>&1; then
   exit 1
 fi
 
-
+apk update -q
 apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
 
 # ===== [2/5] 端口与密钥初始化 =====
