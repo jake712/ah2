@@ -29,22 +29,28 @@ usage() {
 }
 
 is_valid_port() {
-  case "$1" in
+  case "${1:-}" in
     ''|*[!0-9]*) return 1 ;;
   esac
   [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+is_valid_octet() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 0 ] && [ "$1" -le 255 ]
+}
+
 is_valid_ip() {
-  ip="$1"
+  ip="${1:-}"
   if printf '%s' "$ip" \vert{} grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-    IFS=. read -r o1 o2 o3 o4 <<EOF
-$ip
-EOF
-    for o in "$o1" "$o2" "$o3" "$o4"; do
-      [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
-    done
-    return 0
+    o1=$(printf '\%s' "$ip" | cut -d. -f1)
+    o2=$(printf '\%s' "$ip" | cut -d. -f2)
+    o3=$(printf '\%s' "$ip" | cut -d. -f3)
+    o4=$(printf '\%s' "$ip" | cut -d. -f4)
+    is_valid_octet "$o1" && is_valid_octet "$o2" && is_valid_octet "$o3" && is_valid_octet "$o4"
+    return $?
   fi
   if printf '%s' "$ip" \vert{} grep -Eq '^[0-9A-Fa-f:]+$'; then
     case "$ip" in
@@ -315,10 +321,4 @@ if [ "$INSTALL_VLESS" -eq 1 ]; then
     if [ -n "$X25519_JSON" ]; then
       VLESS_PRIV_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
       VLESS_PUB_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-      [ -z "$VLESS_PUB_KEY" ] && VLESS_PUB_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"publicKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-    fi
-
-    if [ -z "$VLESS_PRIV_KEY" ] \vert{}\vert{} [ -z "$VLESS_PUB_KEY" ]; then
-      X25519_TXT=$(/usr/local/bin/xray x25519 2>/dev/null || true)
-      [ -z "$VLESS_PRIV_KEY" ] && VLESS_PRIV_KEY=$(printf '%s\n' "$X25519_TXT" \vert{} awk -F':' '/[Pp]rivate ?[Kk]ey/ {gsub(/^[[:space:]]+\vert{}[[:space:]]+$/, "", $2); print $2; exit}')
-      [ -z "$VLESS_PUB_KEY" ] &&
+      [ -z "$VLESS_PUB_KEY" ] && VLESS_PUB_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"publicKey"[[:space:]]*:[[:space:]]*"\([^"]*\)
