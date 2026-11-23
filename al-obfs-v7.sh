@@ -1,6 +1,7 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 (Gecko) + AnyTLS Alpine 同端口终极完美版部署脚本
+# Hysteria 2 (Gecko) + AnyTLS Alpine 双端口分拆部署脚本
+# 规则: -p 为 Hysteria 2 端口 (HY2_PORT)，AnyTLS 端口为 HY2_PORT + 1
 # 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
 # =========================================================================
 
@@ -17,7 +18,7 @@ while getopts "p:i:h" opt; do
     i) CUSTOM_IP=$OPTARG ;;
     h) 
       echo "用法: $0 [选项]"
-      echo "  -p <端口>   自定义监听端口 (默认随机高位端口)"
+      echo "  -p <端口>   指定 Hysteria 2 起始端口 (AnyTLS 自动使用 <端口+1>，默认随机)"
       echo "  -i <公网IP> 手动指定服务器公网 IP"
       exit 0 
       ;;
@@ -29,7 +30,7 @@ if [ "$(id -u)" != "0" ]; then
   exit 1 
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 (Gecko) + AnyTLS (同端口双协议完美版) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 (Gecko) + AnyTLS (双端口分拆版) ===${PLAIN}"
 
 # ===== [1/5] 基础环境与依赖 =====
 echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
@@ -48,14 +49,28 @@ apk update -q
 apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
 
 # ===== [2/5] 端口与密钥初始化 =====
-echo -e "${YELLOW}[2/5] 正在初始化端口与安全密钥...${PLAIN}"
+echo -e "${YELLOW}[2/5] 正在初始化双端口与安全密钥...${PLAIN}"
 if [ -n "$CUSTOM_PORT" ]; then
-  PORT=$CUSTOM_PORT
-  echo -e "${CYAN}✔ 使用用户指定的端口: ${PORT}${PLAIN}"
+  case "$CUSTOM_PORT" in
+    ''|*[!0-9]*)
+      echo -e "${RED}错误: 端口必须为纯数字！${PLAIN}"
+      exit 1
+      ;;
+  esac
+  if [ "$CUSTOM_PORT" -lt 1 ] || [ "$CUSTOM_PORT" -gt 65534 ]; then
+    echo -e "${RED}错误: Hysteria 2 端口需在 1-65534 之间（以保留 +1 给 AnyTLS）！${PLAIN}"
+    exit 1
+  fi
+  HY2_PORT=$CUSTOM_PORT
+  echo -e "${CYAN}✔ 使用用户指定的 Hysteria 2 端口: ${HY2_PORT}${PLAIN}"
 else
-  PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
-  echo -e "${CYAN}✔ 未指定端口，已自动生成随机端口: ${PORT}${PLAIN}"
+  # 随机生成 10000-54999，确保 +1 后不超过 65535
+  HY2_PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
+  echo -e "${CYAN}✔ 未指定端口，已自动生成随机 Hysteria 2 端口: ${HY2_PORT}${PLAIN}"
 fi
+
+ATLS_PORT=$((HY2_PORT + 1))
+echo -e "${CYAN}✔ AnyTLS 自动分配端口 (-p + 1): ${ATLS_PORT}${PLAIN}"
 
 HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
 HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
@@ -136,9 +151,9 @@ openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt \
   -days 3650 2>/dev/null
 chmod 600 /etc/hysteria/key.key
 
-# 写入 Hysteria 2 YAML 配置 (Gecko 混淆)
+# 写入 Hysteria 2 YAML 配置 (监听 HY2_PORT)
 cat > /etc/hysteria/config.yaml <<EOF
-listen: :${PORT}
+listen: :${HY2_PORT}
 auth:
   type: password
   password: ${HY_PASS}
@@ -162,14 +177,14 @@ pkill -x "$DISGUISE_HY" 2>/dev/null || true
 [ "$INSTALL_ATLS" = "1" ] && { pkill -x "$DISGUISE_ATLS" 2>/dev/null || true; }
 sleep 1
 
-# 启动 Hysteria 2
+# 启动 Hysteria 2 (-p 端口)
 nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
 
-# 启动 AnyTLS (自动适配证书参数，复用同一套证书与私钥)
+# 启动 AnyTLS (-p + 1 端口，优先复用已生成的证书与私钥)
 ATLS_CERT_STATUS="内建临时证书"
 if [ "$INSTALL_ATLS" = "1" ]; then
   ATLS_HELP=$(/usr/local/bin/$DISGUISE_ATLS --help 2>&1 || true)
-  ATLS_ARGS="-l :${PORT} -p ${ATLS_PASS}"
+  ATLS_ARGS="-l :${ATLS_PORT} -p ${ATLS_PASS}"
 
   if echo "$ATLS_HELP" | grep -q -- "--cert" && echo "$ATLS_HELP" | grep -q -- "--key"; then
     ATLS_ARGS="$ATLS_ARGS --cert /etc/hysteria/cert.crt --key /etc/hysteria/key.key"
@@ -189,27 +204,32 @@ if [ -z "$SERVER_IP" ]; then
 fi
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
-echo -e "${GREEN}🎉 同端口双协议 (Gecko 混淆) 完美版部署成功！${PLAIN}"
+echo -e "${GREEN}🎉 双端口分拆版 (Hysteria 2 + AnyTLS) 部署成功！${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
-echo -e " 📍 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
-echo -e " 🔢 共用监听端口 (Port)  : ${CYAN}${PORT} (TCP & UDP)${PLAIN}"
-echo -e " 🌐 共享伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
+echo -e " 📍 服务器地址 (Address)  : ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e " 🚀 Hysteria 2 端口 (-p) : ${CYAN}${HY2_PORT} (UDP)${PLAIN}"
+if [ "$INSTALL_ATLS" = "1" ]; then
+  echo -e " 🔐 AnyTLS 端口 (-p + 1) : ${CYAN}${ATLS_PORT} (TCP)${PLAIN}"
+fi
+echo -e " 🌐 共享伪装域名 (SNI)    : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 echo -e " [1] Hysteria 2 配置信息 (Gecko)"
+echo -e "   - 监听端口 : ${CYAN}${HY2_PORT}${PLAIN}"
 echo -e "   - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
 echo -e "   - 混淆类型 : ${CYAN}gecko${PLAIN}"
 echo -e "   - 混淆密码 : ${CYAN}${HY_OBFS_PASS}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 if [ "$INSTALL_ATLS" = "1" ]; then
   echo -e " [2] AnyTLS 配置信息"
+  echo -e "   - 监听端口 : ${CYAN}${ATLS_PORT}${PLAIN}"
   echo -e "   - 认证密码 : ${CYAN}${ATLS_PASS}${PLAIN}"
   echo -e "   - 证书状态 : ${CYAN}${ATLS_CERT_STATUS}${PLAIN}"
   echo -e "----------------------------------------------------------------"
 fi
 echo -e "${YELLOW}[Hysteria 2 直连链接]:${PLAIN}"
-echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${PORT}?insecure=1&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#Hy2-Gecko-SharedPort${PLAIN}"
+echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${HY2_PORT}?insecure=1&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#Hy2-Gecko-${HY2_PORT}${PLAIN}"
 if [ "$INSTALL_ATLS" = "1" ]; then
   echo -e "\n${YELLOW}[AnyTLS 直连链接]:${PLAIN}"
-  echo -e "${CYAN}anytls://${ATLS_PASS}@${SERVER_IP}:${PORT}?sni=${OPTIMIZED_SNI}&insecure=1#AnyTLS-SharedPort${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${SERVER_IP}:${ATLS_PORT}?sni=${OPTIMIZED_SNI}&insecure=1#AnyTLS-${ATLS_PORT}${PLAIN}"
 fi
 echo -e "${GREEN}================================================================${PLAIN}"
