@@ -116,7 +116,7 @@ fi
 
 # ===== [4/5] 优选 SNI 与生成配置 =====
 echo -e "${YELLOW}[4/5] 智能优选 SNI 并生成证书与配置...${PLAIN}"
-SNI_CANDIDATES="www.bing.com www.apple.com www.cloudflare.com"
+SNI_CANDIDATES="www.amd.com www.apple.com www.microsoft.com www.samsung.com www.sony.com www.oracle.com"
 OPTIMIZED_SNI="www.bing.com"
 LOWEST_LATENCY=9999
 for domain in $SNI_CANDIDATES; do
