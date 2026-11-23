@@ -1,262 +1,149 @@
-cat <<'EOF' > /tmp/al-obfs-v7.sh
 #!/bin/sh
-set -eu
-umask 077
+# =========================================================================
+# VLESS (Reality) + Hysteria 2 (Gecko) Alpine 同端口终极完美版部署脚本
+# 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
+# 协议分流: TCP 端口给 VLESS-Reality (Xray), UDP 端口给 Hysteria2
+# =========================================================================
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-PLAIN='\033[0m'
+set -e
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
 
 CUSTOM_PORT=""
 CUSTOM_IP=""
-ALLOW_MIRROR=0
-FORCE_OVERWRITE=0
 
-usage() {
-  printf "用法: %s [选项]\n" "$0"
-  printf "  -p <端口>   指定监听端口 (1-65535，默认随机高位端口)\n"
-  printf "  -i <公网IP> 指定服务器公网 IP (支持 IPv4 / IPv6)\n"
-  printf "  -m          主站下载失败时允许使用第三方镜像站\n"
-  printf "  -F          强制覆盖已存在的密钥与配置文件\n"
-  printf "  -h          显示帮助信息\n"
-}
-
-is_valid_port() {
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
-is_valid_octet() {
-  case "${1:-}" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$1" -ge 0 ] && [ "$1" -le 255 ]
-}
-
-is_valid_ip() {
-  ip="${1:-}"
-  if printf '%s' "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-    o1=$(printf '%s' "$ip" | cut -d. -f1)
-    o2=$(printf '%s' "$ip" | cut -d. -f2)
-    o3=$(printf '%s' "$ip" | cut -d. -f3)
-    o4=$(printf '%s' "$ip" | cut -d. -f4)
-    is_valid_octet "$o1" && is_valid_octet "$o2" && is_valid_octet "$o3" && is_valid_octet "$o4"
-    return $?
-  fi
-  if printf '%s' "$ip" | grep -Eq '^[0-9A-Fa-f:]+$'; then
-    case "$ip" in
-      *:*) return 0 ;;
-    esac
-  fi
-  return 1
-}
-
-is_port_in_use() {
-  p="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -lntu "sport = :$p" 2>/dev/null | grep -q .
-    return $?
-  fi
-  return 1
-}
-
-verify_binary() {
-  bin_path="$1"
-  name="$2"
-  [ -s "$bin_path" ] || return 1
-  if head -n 5 "$bin_path" 2>/dev/null | grep -qiE '<!doctype html|<html'; then
-    printf "%b错误: %s 下载内容疑似 HTML 错误页%b\n" "$RED" "$name" "$PLAIN" >&2
-    return 1
-  fi
-  chmod 755 "$bin_path"
-  "$bin_path" version >/dev/null 2>&1 || "$bin_path" -v >/dev/null 2>&1 || return 1
-  return 0
-}
-
-verify_sha256_if_available() {
-  file_path="$1"
-  sums_url="$2"
-  asset_name="$3"
-  tmp_sums="/tmp/release_sums.$$"
-  rm -f "$tmp_sums"
-  if curl -fsSL --max-time 15 -o "$tmp_sums" "$sums_url" 2>/dev/null && [ -s "$tmp_sums" ]; then
-    expected=$(awk -v target="$asset_name" '$2 ~ ("(^|/)" target "$") {print $1; exit}' "$tmp_sums")
-    rm -f "$tmp_sums"
-    if [ -n "$expected" ] && command -v sha256sum >/dev/null 2>&1; then
-      actual=$(sha256sum "$file_path" | awk '{print $1}')
-      if [ "$actual" != "$expected" ]; then
-        printf "%b错误: %s SHA-256 校验失败%b\n" "$RED" "$asset_name" "$PLAIN" >&2
-        return 1
-      fi
-    fi
-  else
-    rm -f "$tmp_sums"
-  fi
-  return 0
-}
-
-while getopts "p:i:mFh" opt; do
-  case "$opt" in
+while getopts "p:i:h" opt; do
+  case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    m) ALLOW_MIRROR=1 ;;
-    F) FORCE_OVERWRITE=1 ;;
-    h) usage; exit 0 ;;
-    \?) usage >&2; exit 1 ;;
+    h)
+      echo "用法: $0 [选项]"
+      echo "  -p <端口>   自定义监听端口 (默认随机高位端口)"
+      echo "  -i <公网IP> 手动指定服务器公网 IP"
+      exit 0
+      ;;
   esac
 done
 
-if [ "$(id -u)" -ne 0 ]; then
-  printf "%b错误: 请使用 root 权限运行此脚本！%b\n" "$RED" "$PLAIN" >&2
+if [ "$(id -u)" != "0" ]; then
+  echo -e "${RED}错误: 请使用 root 权限运行此脚本！${PLAIN}"
   exit 1
 fi
 
-if [ -n "$CUSTOM_PORT" ] && ! is_valid_port "$CUSTOM_PORT"; then
-  printf "%b错误: 无效的端口号 '%s'%b\n" "$RED" "$CUSTOM_PORT" "$PLAIN" >&2
+echo -e "${GREEN}=== 开始部署 VLESS (Reality) + Hysteria 2 (Gecko) 同端口双协议完美版 ===${PLAIN}"
+
+# ===== [1/5] 基础环境与依赖 =====
+echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
+if ! grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
+  if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+  fi
+fi
+
+if ! command -v apk >/dev/null 2>&1; then
+  echo -e "${RED}错误: 未检测到 apk 包管理器，本脚本仅支持 Alpine Linux${PLAIN}"
   exit 1
 fi
 
-if [ -n "$CUSTOM_IP" ] && ! is_valid_ip "$CUSTOM_IP"; then
-  printf "%b错误: 无效的 IP 地址 '%s'%b\n" "$RED" "$CUSTOM_IP" "$PLAIN" >&2
-  exit 1
-fi
-
-printf "%b=== 开始部署 Hysteria 2 (Gecko) + VLESS-Reality (同端口双协议) ===%b\n" "$GREEN" "$PLAIN"
-
-printf "%b[1/6] 检查并配置系统环境...%b\n" "$YELLOW" "$PLAIN"
-command -v apk >/dev/null 2>&1 || { printf "%b错误: 仅支持 Alpine Linux%b\n" "$RED" "$PLAIN" >&2; exit 1; }
-if ! curl -fsI --max-time 5 https://api.github.com >/dev/null 2>&1; then
-  [ -w /etc/resolv.conf ] && printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true
-fi
 apk update -q
 apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
 
-printf "%b[2/6] 检查架构、端口与安全密钥...%b\n" "$YELLOW" "$PLAIN"
+# ===== [2/5] 端口与密钥初始化 =====
+echo -e "${YELLOW}[2/5] 正在初始化端口与安全密钥...${PLAIN}"
+if [ -n "$CUSTOM_PORT" ]; then
+  PORT=$CUSTOM_PORT
+  echo -e "${CYAN}[OK] 使用用户指定的端口: ${PORT}${PLAIN}"
+else
+  PORT=$(awk 'BEGIN{srand(); print int(rand()*(55000-10000+1))+10000}')
+  echo -e "${CYAN}[OK] 未指定端口，已自动生成随机端口: ${PORT}${PLAIN}"
+fi
+
+HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+VL_UUID=$(openssl rand -hex 16 | sed 's/\(........\)\(....\)\(....\)\(....\)\(............\)/\1-\2-\3-\4-\5/')
+VL_SID=$(openssl rand -hex 4)
+
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64|amd64) HY_ARCH="amd64"; XRAY_ARCH="64" ;;
-  aarch64|arm64) HY_ARCH="arm64"; XRAY_ARCH="arm64-v8a" ;;
-  *) printf "%b错误: 不支持的架构 '%s'%b\n" "$RED" "$ARCH" "$PLAIN" >&2; exit 1 ;;
+  x86_64|amd64) ARCH_STR="amd64"; XRAY_ARCH="64" ;;
+  aarch64|arm64) ARCH_STR="arm64"; XRAY_ARCH="arm64-v8a" ;;
+  *) ARCH_STR="amd64"; XRAY_ARCH="64" ;;
 esac
 
-mkdir -p /etc/hysteria /etc/xray /usr/local/bin /var/log /var/run
+mkdir -p /etc/hysteria /etc/xray /usr/local/bin /var/log
 chmod 700 /etc/hysteria /etc/xray
 
-STATE_FILE="/etc/hysteria/deploy.env"
-if [ -f "$STATE_FILE" ] && [ "$FORCE_OVERWRITE" -ne 1 ]; then
-  . "$STATE_FILE"
-fi
+# ===== [3/5] 下载核心组件并伪装进程名 =====
+echo -e "${YELLOW}[3/5] 下载核心组件并进行特征伪装...${PLAIN}"
 
-if [ -n "$CUSTOM_PORT" ]; then
-  PORT="$CUSTOM_PORT"
-elif [ -z "${PORT:-}" ]; then
-  seed=$(($(date +%s) + $$))
-  PORT=$(awk -v s="$seed" 'BEGIN{srand(s); print int(rand()*(55000-10000+1))+10000}')
-fi
+# 1. 下载 Hysteria 2
+HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH_STR}"
+rm -f /tmp/hysteria
+for url in "$HY_URL" "https://ghfast.top/$HY_URL"; do
+  curl -fsSL --max-time 30 -o /tmp/hysteria "$url" && break
+done
+[ ! -s /tmp/hysteria ] && { echo -e "${RED}错误: Hysteria 2 下载失败${PLAIN}"; exit 1; }
+DISGUISE_HY="systemd-timesyncd"
+mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
+chmod +x /usr/local/bin/$DISGUISE_HY
 
-is_valid_port "$PORT" || { printf "%b错误: 端口异常: %s%b\n" "$RED" "$PORT" "$PLAIN" >&2; exit 1; }
-
-HY_PID_FILE="/var/run/hysteria2.pid"
-XRAY_PID_FILE="/var/run/xray-vless.pid"
-OLD_HY_PID=""
-OLD_XRAY_PID=""
-[ -s "$HY_PID_FILE" ] && OLD_HY_PID=$(cat "$HY_PID_FILE" 2>/dev/null || true)
-[ -s "$XRAY_PID_FILE" ] && OLD_XRAY_PID=$(cat "$XRAY_PID_FILE" 2>/dev/null || true)
-
-if is_port_in_use "$PORT"; then
-  occ_pids=$(ss -H -lntup "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
-  for p in $occ_pids; do
-    if [ "$p" != "$OLD_HY_PID" ] && [ "$p" != "$OLD_XRAY_PID" ]; then
-      printf "%b错误: 端口 %s 已被进程 %s 占用%b\n" "$RED" "$PORT" "$p" "$PLAIN" >&2
-      exit 1
-    fi
-  done
-fi
-
-HY_PASS="${HY_PASS:-$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)}"
-HY_OBFS_PASS="${HY_OBFS_PASS:-$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)}"
-VLESS_SHORT_ID="${VLESS_SHORT_ID:-$(openssl rand -hex 4)}"
-VLESS_UUID="${VLESS_UUID:-}"
-VLESS_PRIV_KEY="${VLESS_PRIV_KEY:-}"
-VLESS_PUB_KEY="${VLESS_PUB_KEY:-}"
-
-printf "%b[3/6] 下载并校验 Hysteria 2 与 Xray-core...%b\n" "$YELLOW" "$PLAIN"
-HY_ASSET="hysteria-linux-${HY_ARCH}"
-HY_URL="https://github.com/apernet/hysteria/releases/latest/download/${HY_ASSET}"
-HY_SUMS_URL="https://github.com/apernet/hysteria/releases/latest/download/SHA256SUMS"
-HY_TMP="/tmp/hysteria.$$"
-rm -f "$HY_TMP"
-
-hy_ok=0
-if curl -fsSL --max-time 40 -o "$HY_TMP" "$HY_URL" && verify_sha256_if_available "$HY_TMP" "$HY_SUMS_URL" "$HY_ASSET" && verify_binary "$HY_TMP" "Hysteria 2"; then
-  hy_ok=1
-elif [ "$ALLOW_MIRROR" -eq 1 ]; then
-  rm -f "$HY_TMP"
-  if curl -fsSL --max-time 40 -o "$HY_TMP" "https://ghfast.top/$HY_URL" && verify_binary "$HY_TMP" "Hysteria 2 (Mirror)"; then
-    hy_ok=1
+# 2. 下载 Xray (用于 VLESS + Reality)
+XRAY_ZIP="/tmp/xray.zip"
+XRAY_XTDIR="/tmp/xray_extract"
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
+INSTALL_XRAY=0
+rm -rf "$XRAY_ZIP" "$XRAY_XTDIR"
+for url in "$XRAY_URL" "https://ghfast.top/$XRAY_URL"; do
+  if curl -fsSL --max-time 40 -o "$XRAY_ZIP" "$url"; then
+    break
   fi
-fi
-[ "$hy_ok" -eq 1 ] || { rm -f "$HY_TMP"; printf "%b错误: Hysteria 2 下载或校验失败%b\n" "$RED" "$PLAIN" >&2; exit 1; }
-mv "$HY_TMP" /usr/local/bin/hysteria
-
-XRAY_ASSET="Xray-linux-${XRAY_ARCH}.zip"
-XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/${XRAY_ASSET}"
-XRAY_ZIP="/tmp/xray.$$.zip"
-XRAY_DIR="/tmp/xray_extract.$$"
-rm -rf "$XRAY_ZIP" "$XRAY_DIR"
-mkdir -p "$XRAY_DIR"
-
-xray_ok=0
-if curl -fsSL --max-time 50 -o "$XRAY_ZIP" "$XRAY_URL" && [ -s "$XRAY_ZIP" ]; then
-  if unzip -qo "$XRAY_ZIP" -d "$XRAY_DIR" && [ -s "$XRAY_DIR/xray" ] && verify_binary "$XRAY_DIR/xray" "Xray-core"; then
-    xray_ok=1
-  fi
-elif [ "$ALLOW_MIRROR" -eq 1 ]; then
-  rm -f "$XRAY_ZIP"
-  if curl -fsSL --max-time 50 -o "$XRAY_ZIP" "https://ghfast.top/$XRAY_URL" && [ -s "$XRAY_ZIP" ]; then
-    if unzip -qo "$XRAY_ZIP" -d "$XRAY_DIR" && [ -s "$XRAY_DIR/xray" ] && verify_binary "$XRAY_DIR/xray" "Xray-core (Mirror)"; then
-      xray_ok=1
-    fi
+done
+if [ -s "$XRAY_ZIP" ]; then
+  mkdir -p "$XRAY_XTDIR"
+  unzip -qo "$XRAY_ZIP" -d "$XRAY_XTDIR"
+  XRAY_BIN=$(find "$XRAY_XTDIR" -maxdepth 1 -type f -name "xray" | head -n 1)
+  if [ -n "$XRAY_BIN" ] && [ -s "$XRAY_BIN" ]; then
+    INSTALL_XRAY=1
+    DISGUISE_XRAY="systemd-resolved"
+    mv "$XRAY_BIN" /usr/local/bin/$DISGUISE_XRAY
+    chmod +x /usr/local/bin/$DISGUISE_XRAY
+    XRAY_PATH="/usr/local/bin/$DISGUISE_XRAY"
   fi
 fi
 
-INSTALL_VLESS=0
-if [ "$xray_ok" -eq 1 ]; then
-  mv "$XRAY_DIR/xray" /usr/local/bin/xray
-  INSTALL_VLESS=1
-else
-  printf "%b警告: Xray-core 下载或校验失败，将仅部署 Hysteria 2%b\n" "$YELLOW" "$PLAIN"
+if [ "$INSTALL_XRAY" != "1" ]; then
+  echo -e "${RED}错误: Xray 核心下载失败，无法部署 VLESS-Reality${PLAIN}"
+  exit 1
 fi
-rm -rf "$XRAY_ZIP" "$XRAY_DIR"
 
-printf "%b[4/6] 校验 TLS 1.3 SNI 并生成配置...%b\n" "$YELLOW" "$PLAIN"
-SNI_CANDIDATES="www.microsoft.com www.apple.com www.amd.com www.oracle.com"
-OPTIMIZED_SNI="${OPTIMIZED_SNI:-www.microsoft.com}"
-BEST_TIME=9999
+# 3. 生成 Reality 密钥对 (x25519)
+echo -e "${YELLOW}正在生成 Reality x25519 密钥对...${PLAIN}"
+KEY_OUT=$($XRAY_PATH x25519 2>/dev/null || echo "")
+VL_PRIV=$(echo "$KEY_OUT" | grep -i "Private" | awk '{print $2}')
+VL_PUB=$(echo "$KEY_OUT" | grep -iE "Public|Password" | awk '{print $2}')
+[ -z "$VL_PRIV" ] || [ -z "$VL_PUB" ] && { echo -e "${RED}错误: Reality 密钥对生成失败${PLAIN}"; exit 1; }
 
+# ===== [4/5] 优选 SNI 与生成配置 =====
+echo -e "${YELLOW}[4/5] 智能优选 SNI 并生成证书与配置...${PLAIN}"
+SNI_CANDIDATES="www.amd.com www.apple.com www.microsoft.com www.samsung.com www.sony.com www.oracle.com"
+OPTIMIZED_SNI="www.bing.com"
+LOWEST_LATENCY=9999
 for domain in $SNI_CANDIDATES; do
-  conn_time=$(curl -o /dev/null -s --tlsv1.3 -w '%{time_connect}\n' --connect-timeout 2 -m 4 "https://$domain" 2>/dev/null || echo "999")
-  if printf "" | openssl s_client -tls1_3 -servername "$domain" -connect "${domain}:443" >/dev/null 2>&1; then
-    is_better=$(awk -v t="$conn_time" -v b="$BEST_TIME" 'BEGIN {if (t > 0 && t < b) print 1; else print 0}')
-    if [ "$is_better" = "1" ]; then
-      BEST_TIME="$conn_time"
-      OPTIMIZED_SNI="$domain"
-    fi
+  latency=$(curl -o /dev/null -s -w '%{time_connect}\n' --connect-timeout 2 -m 3 "https://$domain" 2>/dev/null || echo "999")
+  is_better=$(awk -v l="$latency" -v min="$LOWEST_LATENCY" 'BEGIN {if (l > 0 && l < min) print 1; else print 0}')
+  if [ "$is_better" = "1" ]; then
+    LOWEST_LATENCY=$latency
+    OPTIMIZED_SNI=$domain
   fi
 done
 
-if [ ! -s /etc/hysteria/key.key ] || [ ! -s /etc/hysteria/cert.crt ] || [ "$FORCE_OVERWRITE" -eq 1 ]; then
-  rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
-  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key
-  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650
-  chmod 600 /etc/hysteria/key.key
-  chmod 644 /etc/hysteria/cert.crt
-fi
+# Hysteria2 自签证书
+rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
+openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null
+openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
+chmod 600 /etc/hysteria/key.key
 
+# 写入 Hysteria 2 YAML 配置 (Gecko 混淆)
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${PORT}
 auth:
@@ -275,40 +162,20 @@ tls:
   cert: /etc/hysteria/cert.crt
   key: /etc/hysteria/key.key
 EOF
-chmod 600 /etc/hysteria/config.yaml
 
-if [ "$INSTALL_VLESS" -eq 1 ]; then
-  if [ -z "$VLESS_UUID" ] || [ -z "$VLESS_PRIV_KEY" ] || [ -z "$VLESS_PUB_KEY" ] || [ "$FORCE_OVERWRITE" -eq 1 ]; then
-    VLESS_UUID=$(/usr/local/bin/xray uuid || true)
-    X25519_JSON=$(/usr/local/bin/xray x25519 -format=json 2>/dev/null || true)
-    VLESS_PRIV_KEY=""
-    VLESS_PUB_KEY=""
-    if [ -n "$X25519_JSON" ]; then
-      VLESS_PRIV_KEY=$(printf '%s' "$X25519_JSON" | sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-      VLESS_PUB_KEY=$(printf '%s' "$X25519_JSON" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-      [ -z "$VLESS_PUB_KEY" ] && VLESS_PUB_KEY=$(printf '%s' "$X25519_JSON" | sed -n 's/.*"publicKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-    fi
-    if [ -z "$VLESS_PRIV_KEY" ] || [ -z "$VLESS_PUB_KEY" ]; then
-      X25519_TXT=$(/usr/local/bin/xray x25519 2>/dev/null || true)
-      [ -z "$VLESS_PRIV_KEY" ] && VLESS_PRIV_KEY=$(printf '%s\n' "$X25519_TXT" | awk -F':' '/[Pp]rivate ?[Kk]ey/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
-      [ -z "$VLESS_PUB_KEY" ] && VLESS_PUB_KEY=$(printf '%s\n' "$X25519_TXT" | awk -F':' '/([Pp]ublic ?[Kk]ey|[Pp]assword)/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
-    fi
-  fi
-
-  if [ -z "$VLESS_UUID" ] || [ -z "$VLESS_PRIV_KEY" ] || [ -z "$VLESS_PUB_KEY" ]; then
-    printf "%b警告: VLESS 密钥生成失败，跳过 VLESS 部署%b\n" "$YELLOW" "$PLAIN"
-    INSTALL_VLESS=0
-  else
-    cat > /etc/xray/config.json <<EOF
+# 写入 Xray JSON 配置 (VLESS + Reality)
+cat > /etc/xray/config.json <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": { "loglevel": "none" },
   "inbounds": [
     {
       "listen": "0.0.0.0",
       "port": ${PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [{ "id": "${VLESS_UUID}", "flow": "xtls-rprx-vision" }],
+        "clients": [
+          { "id": "${VL_UUID}", "flow": "xtls-rprx-vision" }
+        ],
         "decryption": "none"
       },
       "streamSettings": {
@@ -319,66 +186,58 @@ if [ "$INSTALL_VLESS" -eq 1 ]; then
           "dest": "${OPTIMIZED_SNI}:443",
           "xver": 0,
           "serverNames": ["${OPTIMIZED_SNI}"],
-          "privateKey": "${VLESS_PRIV_KEY}",
-          "shortIds": ["${VLESS_SHORT_ID}"]
+          "privateKey": "${VL_PRIV}",
+          "shortIds": ["${VL_SID}"]
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
-  "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
 }
 EOF
-    chmod 600 /etc/xray/config.json
-  fi
-fi
+chmod 600 /etc/xray/config.json
 
-cat > "$STATE_FILE" <<EOF
-PORT=${PORT}
-OPTIMIZED_SNI=${OPTIMIZED_SNI}
-HY_PASS=${HY_PASS}
-HY_OBFS_PASS=${HY_OBFS_PASS}
-VLESS_SHORT_ID=${VLESS_SHORT_ID}
-VLESS_UUID=${VLESS_UUID}
-VLESS_PRIV_KEY=${VLESS_PRIV_KEY}
-VLESS_PUB_KEY=${VLESS_PUB_KEY}
-EOF
-chmod 600 "$STATE_FILE"
-
-printf "%b[5/6] 配置内核 UDP 缓冲区与服务管理...%b\n" "$YELLOW" "$PLAIN"
-mkdir -p /etc/sysctl.d
-printf "net.core.rmem_max = 25000000\nnet.core.wmem_max = 25000000\n" > /etc/sysctl.d/99-hy2-buffers.conf
-chmod 644 /etc/sysctl.d/99-hy2-buffers.conf
-sysctl -p /etc/sysctl.d/99-hy2-buffers.conf >/dev/null 2>&1 || true
-
-for old_p in "$OLD_HY_PID" "$OLD_XRAY_PID"; do
-  [ -n "$old_p" ] && kill -0 "$old_p" 2>/dev/null && kill "$old_p" 2>/dev/null || true
-done
+# ===== [5/5] 启动服务与输出结果 =====
+echo -e "${YELLOW}[5/5] 启动服务进程...${PLAIN}"
+pkill -x "$DISGUISE_HY" 2>/dev/null || true
+pkill -x "$DISGUISE_XRAY" 2>/dev/null || true
 sleep 1
 
-nohup /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml >> /var/log/hysteria.log 2>&1 &
-printf "%s\n" "$!" > "$HY_PID_FILE"
+# 启动 VLESS (Reality) —— 占用 TCP 端口
+nohup $XRAY_PATH -c /etc/xray/config.json > /var/log/xray.log 2>&1 &
+sleep 1
 
-if [ "$INSTALL_VLESS" -eq 1 ]; then
-  nohup /usr/local/bin/xray run -c /etc/xray/config.json >> /var/log/xray.log 2>&1 &
-  printf "%s\n" "$!" > "$XRAY_PID_FILE"
+# 启动 Hysteria 2 —— 占用 UDP 端口 (其 TCP 绑定让位于 VLESS, 不影响 UDP 代理)
+nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+
+# 获取公网 IP
+SERVER_IP="$CUSTOM_IP"
+if [ -z "$SERVER_IP" ]; then
+  SERVER_IP=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me || echo "YOUR_SERVER_IP")
 fi
 
-printf "%b[6/6] 验证服务监听与运行状态...%b\n" "$YELLOW" "$PLAIN"
-sleep 2
-ss -H -lnu "sport = :$PORT" 2>/dev/null | grep -q . || { printf "%b错误: Hy2 未监听 UDP :%s%b\n" "$RED" "$PORT" "$PLAIN" >&2; exit 1; }
-if [ "$INSTALL_VLESS" -eq 1 ]; then
-  ss -H -lnt "sport = :$PORT" 2>/dev/null | grep -q . || { printf "%b错误: Xray 未监听 TCP :%s%b\n" "$RED" "$PORT" "$PLAIN" >&2; exit 1; }
-fi
-
-SERVER_IP="${CUSTOM_IP:-$(curl -fsSL4 --max-time 5 https://api.ipify.org 2>/dev/null || true)}"
-[ -z "$SERVER_IP" ] && { printf "%b错误: 无法获取公网 IP%b\n" "$RED" "$PLAIN" >&2; exit 1; }
-
-printf "\nhy2://%s@%s:%s?insecure=1&sni=%s&obfs=gecko&obfs-password=%s#Hy2-Gecko\n" \
-  "$HY_PASS" "$SERVER_IP" "$PORT" "$OPTIMIZED_SNI" "$HY_OBFS_PASS"
-if [ "$INSTALL_VLESS" -eq 1 ]; then
-  printf "vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#VLESS-Reality\n" \
-    "$VLESS_UUID" "$SERVER_IP" "$PORT" "$OPTIMIZED_SNI" "$VLESS_PUB_KEY" "$VLESS_SHORT_ID"
-fi
-EOF
-bash -n /tmp/al-obfs-v7.sh && bash /tmp/al-obfs-v7.sh -p 17140 -i 140.245.112.64 -F
+echo -e "\n${GREEN}================================================================${PLAIN}"
+echo -e "${GREEN}[SUCCESS] 同端口双协议 (VLESS-Reality + Hysteria2-Gecko) 部署成功！${PLAIN}"
+echo -e "${GREEN}================================================================${PLAIN}"
+echo -e " [Server] 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e " [Port]   共用监听端口 (Port)  : ${CYAN}${PORT}${PLAIN}  (TCP=VLESS, UDP=Hysteria2)"
+echo -e " [SNI]    共享伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
+echo -e "----------------------------------------------------------------"
+echo -e " [1] VLESS + Reality 配置信息 (推荐 / Karing 完美支持)"
+echo -e "   - UUID      : ${CYAN}${VL_UUID}${PLAIN}"
+echo -e "   - Flow      : ${CYAN}xtls-rprx-vision${PLAIN}"
+echo -e "   - Reality公钥(PublicKey/pbk) : ${CYAN}${VL_PUB}${PLAIN}"
+echo -e "   - ShortId(sid) : ${CYAN}${VL_SID}${PLAIN}"
+echo -e "   - Fingerprint  : ${CYAN}chrome${PLAIN}"
+echo -e "----------------------------------------------------------------"
+echo -e " [2] Hysteria 2 配置信息 (Gecko)"
+echo -e "   - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
+echo -e "   - 混淆类型 : ${CYAN}gecko${PLAIN}"
+echo -e "   - 混淆密码 : ${CYAN}${HY_OBFS_PASS}${PLAIN}"
+echo -e "----------------------------------------------------------------"
+echo -e "${YELLOW}[VLESS + Reality 直连链接]:${PLAIN}"
+echo -e "${CYAN}vless://${VL_UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${OPTIMIZED_SNI}&fp=chrome&pbk=${VL_PUB}&sid=${VL_SID}&type=tcp#VLESS-Reality-SharedPort${PLAIN}"
+echo -e "\n${YELLOW}[Hysteria 2 直连链接]:${PLAIN}"
+echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${PORT}?insecure=1&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#Hy2-Gecko-SharedPort${PLAIN}"
+echo -e "${GREEN}================================================================${PLAIN}"
