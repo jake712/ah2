@@ -1,6 +1,6 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 + AnyTLS Alpine 同端口终极完美版部署脚本
+# Hysteria 2 + AnyTLS Alpine 同端口优化部署脚本 (SNI 优选增强版)
 # 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
 # =========================================================================
 
@@ -10,32 +10,35 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PL
 
 CUSTOM_PORT=""
 CUSTOM_IP=""
+CUSTOM_SNI_LIST=""
 
-while getopts "p:i:h" opt; do
+while getopts "p:i:s:h" opt; do
   case $opt in
     p) CUSTOM_PORT=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
-    h) 
+    s) CUSTOM_SNI_LIST=$OPTARG ;;
+    h)
       echo "用法: $0 [选项]"
-      echo "  -p <端口>   自定义监听端口 (默认随机高位端口)"
-      echo "  -i <公网IP> 手动指定服务器公网 IP"
-      exit 0 
+      echo "  -p <端口>       自定义监听端口 (默认随机高位端口 10000-55000)"
+      echo "  -i <公网IP>     手动指定服务器公网 IP"
+      echo "  -s <域名列表>   自定义 SNI 候选池，空格分隔 (例如: \"www.amd.com www.nvidia.com\")"
+      exit 0
       ;;
   esac
 done
 
-if [ "$(id -u)" != "0" ]; then 
+if [ "$(id -u)" != "0" ]; then
   echo -e "${RED}错误: 请使用 root 权限运行此脚本！${PLAIN}"
-  exit 1 
+  exit 1
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (同端口双协议完美版) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 + AnyTLS (同端口双协议 SNI 优选版) ===${PLAIN}"
 
 # ===== [1/5] 基础环境与依赖 =====
 echo -e "${YELLOW}[1/5] 检查并配置系统环境...${PLAIN}"
 if ! grep -q "dns.podman" /etc/resolv.conf 2>/dev/null; then
   if [ ! -s /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
-    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+    printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
   fi
 fi
 
@@ -45,7 +48,7 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 
 apk update -q
-apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
+apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip procps
 
 # ===== [2/5] 端口与密钥初始化 =====
 echo -e "${YELLOW}[2/5] 正在初始化端口与安全密钥...${PLAIN}"
@@ -57,9 +60,9 @@ else
   echo -e "${CYAN}✔ 未指定端口，已自动生成随机端口: ${PORT}${PLAIN}"
 fi
 
-HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
-HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
-ATLS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+HY_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 16)
+HY_OBFS_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 16)
+ATLS_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 16)
 
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -74,7 +77,6 @@ chmod 700 /etc/hysteria
 # ===== [3/5] 下载核心组件并伪装进程名 =====
 echo -e "${YELLOW}[3/5] 下载核心组件并进行特征伪装...${PLAIN}"
 
-# 1. 下载 Hysteria 2
 HY_URL="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH_STR}"
 rm -f /tmp/hysteria
 for url in "$HY_URL" "https://ghfast.top/$HY_URL"; do
@@ -82,30 +84,29 @@ for url in "$HY_URL" "https://ghfast.top/$HY_URL"; do
 done
 [ ! -s /tmp/hysteria ] && { echo -e "${RED}错误: Hysteria 2 下载失败${PLAIN}"; exit 1; }
 DISGUISE_HY="systemd-timesyncd"
-mv /tmp/hysteria /usr/local/bin/$DISGUISE_HY
-chmod +x /usr/local/bin/$DISGUISE_HY
+mv /tmp/hysteria "/usr/local/bin/$DISGUISE_HY"
+chmod +x "/usr/local/bin/$DISGUISE_HY"
 
-# 2. 下载 AnyTLS
 ATLS_API_URL="https://api.github.com/repos/anytls/anytls-go/releases/latest"
-ATLS_ZIP_URL=$(curl -s --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1)
+ATLS_ZIP_URL=$(curl -fsSL --max-time 10 "$ATLS_API_URL" | grep "browser_download_url.*linux_${ARCH_STR}\.zip" | cut -d '"' -f 4 | head -n 1 || true)
 
 INSTALL_ATLS=0
 if [ -n "$ATLS_ZIP_URL" ]; then
-  rm -f /tmp/anytls.zip
+  rm -f /tmp/anytls.zip /tmp/anytls-server /tmp/anytls
   for url in "$ATLS_ZIP_URL" "https://ghfast.top/$ATLS_ZIP_URL"; do
     if curl -fsSL --max-time 30 -o /tmp/anytls.zip "$url"; then
       break
     fi
   done
-  
+
   if [ -s /tmp/anytls.zip ]; then
     unzip -qo /tmp/anytls.zip -d /tmp/
     ATLS_BIN=$(find /tmp -maxdepth 1 -type f \( -name "anytls-server" -o -name "anytls" \) | head -n 1)
     if [ -n "$ATLS_BIN" ] && [ -s "$ATLS_BIN" ]; then
       INSTALL_ATLS=1
       DISGUISE_ATLS="systemd-networkd"
-      mv "$ATLS_BIN" /usr/local/bin/$DISGUISE_ATLS
-      chmod +x /usr/local/bin/$DISGUISE_ATLS
+      mv "$ATLS_BIN" "/usr/local/bin/$DISGUISE_ATLS"
+      chmod +x "/usr/local/bin/$DISGUISE_ATLS"
     fi
   fi
 fi
@@ -115,25 +116,46 @@ if [ "$INSTALL_ATLS" != "1" ]; then
 fi
 
 # ===== [4/5] 优选 SNI 与生成配置 =====
-echo -e "${YELLOW}[4/5] 智能优选 SNI 并生成证书与配置...${PLAIN}"
-SNI_CANDIDATES="www.bing.com www.apple.com www.cloudflare.com"
-OPTIMIZED_SNI="www.bing.com"
-LOWEST_LATENCY=9999
+echo -e "${YELLOW}[4/5] 优选 SNI (基于 TLS 握手耗时) 并生成证书与配置...${PLAIN}"
+
+if [ -n "$CUSTOM_SNI_LIST" ]; then
+  SNI_CANDIDATES="$CUSTOM_SNI_LIST"
+else
+  SNI_CANDIDATES="www.microsoft.com www.amd.com www.nvidia.com www.samsung.com www.amazon.com www.oracle.com"
+fi
+
+OPTIMIZED_SNI=""
+LOWEST_TLS=9999
+
 for domain in $SNI_CANDIDATES; do
-  latency=$(curl -o /dev/null -s -w '%{time_connect}\n' --connect-timeout 2 -m 3 "https://$domain" 2>/dev/null || echo "999")
-  is_better=$(awk -v l="$latency" -v min="$LOWEST_LATENCY" 'BEGIN {if (l > 0 && l < min) print 1; else print 0}')
-  if [ "$is_better" = "1" ]; then
-    LOWEST_LATENCY=$latency
-    OPTIMIZED_SNI=$domain
+  # 使用 time_appconnect 评估完整 TLS 握手耗时，状态码 200/301/302 视为可用
+  result=$(curl -o /dev/null -s -w '%{http_code} %{time_appconnect}' --connect-timeout 2 --max-time 4 "https://$domain" 2>/dev/null || echo "000 999")
+  code=$(echo "$result" | awk '{print $1}')
+  tls_time=$(echo "$result" | awk '{print $2}')
+
+  if [ "$code" != "000" ] && awk -v t="$tls_time" 'BEGIN {exit !(t > 0 && t < 5)}'; then
+    echo -e "  - 候選 ${domain}: HTTP ${code}, TLS 握手 ${tls_time}s"
+    if awk -v t="$tls_time" -v min="$LOWEST_TLS" 'BEGIN {exit !(t < min)}'; then
+      LOWEST_TLS=$tls_time
+      OPTIMIZED_SNI=$domain
+    fi
+  else
+    echo -e "  - 候選 ${domain}: 不可用或逾時 (${code})"
   fi
 done
+
+if [ -z "$OPTIMIZED_SNI" ]; then
+  OPTIMIZED_SNI="www.microsoft.com"
+  echo -e "${YELLOW}提示: 所有候選 SNI 測試均未通過，回退使用 ${OPTIMIZED_SNI}${PLAIN}"
+else
+  echo -e "${GREEN}✔ 已選定最佳 SNI: ${OPTIMIZED_SNI} (TLS 握手 ${LOWEST_TLS}s)${PLAIN}"
+fi
 
 rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
 openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/dev/null
 openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
 chmod 600 /etc/hysteria/key.key
 
-# 写入 Hysteria 2 YAML 配置
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :${PORT}
 auth:
@@ -159,26 +181,33 @@ pkill -x "$DISGUISE_HY" 2>/dev/null || true
 [ "$INSTALL_ATLS" = "1" ] && { pkill -x "$DISGUISE_ATLS" 2>/dev/null || true; }
 sleep 1
 
-# 启动 Hysteria 2
-nohup /usr/local/bin/$DISGUISE_HY server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
-
-# 启动 AnyTLS (使用正确的 -l 与 -p 命令行参数，无需配置文件)
-if [ "$INSTALL_ATLS" = "1" ]; then
-  nohup /usr/local/bin/$DISGUISE_ATLS -l ":${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
+nohup "/usr/local/bin/$DISGUISE_HY" server -c /etc/hysteria/config.yaml > /var/log/hysteria.log 2>&1 &
+sleep 1
+if ! pgrep -x "$DISGUISE_HY" >/dev/null 2>&1; then
+  echo -e "${RED}错误: Hysteria 2 启动失败，请查看 /var/log/hysteria.log${PLAIN}"
+  exit 1
 fi
 
-# 获取公网 IP
+if [ "$INSTALL_ATLS" = "1" ]; then
+  nohup "/usr/local/bin/$DISGUISE_ATLS" -l ":${PORT}" -p "${ATLS_PASS}" > /var/log/anytls.log 2>&1 &
+  sleep 1
+  if ! pgrep -x "$DISGUISE_ATLS" >/dev/null 2>&1; then
+    echo -e "${YELLOW}警告: AnyTLS 启动失败，请查看 /var/log/anytls.log${PLAIN}"
+    INSTALL_ATLS=0
+  fi
+fi
+
 SERVER_IP="$CUSTOM_IP"
 if [ -z "$SERVER_IP" ]; then
-  SERVER_IP=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me || echo "YOUR_SERVER_IP")
+  SERVER_IP=$(curl -4fs --max-time 4 https://api.ipify.org || curl -4fs --max-time 4 https://ifconfig.me || echo "YOUR_SERVER_IP")
 fi
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
-echo -e "${GREEN}🎉 同端口双协议完美版部署成功！${PLAIN}"
+echo -e "${GREEN}🎉 同端口双协议优化版部署完成！${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e " 📍 服务器地址 (Address) : ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e " 🔢 共用监听端口 (Port)  : ${CYAN}${PORT} (TCP & UDP)${PLAIN}"
-echo -e " 🌐 共享伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
+echo -e " 🌐 优选伪装域名 (SNI)   : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 echo -e " [1] Hysteria 2 配置信息"
 echo -e "   - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
