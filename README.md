@@ -10,13 +10,13 @@ SSH的IP
 
 Alpine 一鍵安裝Hysteria 2 + AnyTls單端口穩定版(65M Ram可用)
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/al-obfs-v6.sh | bash -s -- -p 端口 -i 主機出口IP
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/al-obfs-v6.sh | bash -s -- -p 端口 -i 主機IP
 ```
 
 Debian 一鍵安裝Hysteria 2 + AnyTls單端口穩定版(65M Ram可用)
  
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfs-v5  | bash -s -- -p 端口 -i 主機出口IP
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfs-v6.sh  | bash -s -- -p 端口 -i 主機IP
 ```
 
 youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
