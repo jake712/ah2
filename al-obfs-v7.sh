@@ -1,3 +1,4 @@
+cat <<'EOF' > /tmp/al-obfs-v7.sh
 #!/bin/sh
 # =========================================================================
 # Hysteria 2 (Gecko) + VLESS (XTLS-Reality) Alpine 同端口部署脚本
@@ -190,4 +191,134 @@ OLD_XRAY_PID=""
 [ -s "$XRAY_PID_FILE" ] && OLD_XRAY_PID=$(cat "$XRAY_PID_FILE" 2>/dev/null || true)
 
 if is_port_in_use "$PORT"; then
-  occ_pids=$(ss -H -lntup "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).
+  occ_pids=$(ss -H -lntup "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
+  for p in $occ_pids; do
+    if [ "$p" != "$OLD_HY_PID" ] && [ "$p" != "$OLD_XRAY_PID" ]; then
+      printf "%b错误: 端口 %s 已被其他进程 (PID %s) 占用%b\n" "$RED" "$PORT" "$p" "$PLAIN" >&2
+      exit 1
+    fi
+  done
+fi
+
+HY_PASS="${HY_PASS:-$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)}"
+HY_OBFS_PASS="${HY_OBFS_PASS:-$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)}"
+VLESS_SHORT_ID="${VLESS_SHORT_ID:-$(openssl rand -hex 4)}"
+VLESS_UUID="${VLESS_UUID:-}"
+VLESS_PRIV_KEY="${VLESS_PRIV_KEY:-}"
+VLESS_PUB_KEY="${VLESS_PUB_KEY:-}"
+
+# ===== [3/6] 下载与校验核心组件 =====
+printf "%b[3/6] 下载并校验 Hysteria 2 与 Xray-core...%b\n" "$YELLOW" "$PLAIN"
+
+HY_ASSET="hysteria-linux-${HY_ARCH}"
+HY_URL="https://github.com/apernet/hysteria/releases/latest/download/${HY_ASSET}" HY_SUMS_URL="https://github.com/apernet/hysteria/releases/latest/download/SHA256SUMS" HY_TMP="/tmp/hysteria.$$"
+rm -f "$HY_TMP"
+
+hy_ok=0
+if curl -fsSL --max-time 40 -o "$HY_TMP" "$HY_URL" && verify_sha256_if_available "$HY_TMP" "$HY_SUMS_URL" "$HY_ASSET" && verify_binary "$HY_TMP" "Hysteria 2"; then
+  hy_ok=1
+elif [ "$ALLOW_MIRROR" -eq 1 ]; then
+  rm -f "$HY_TMP"
+  if curl -fsSL --max-time 40 -o "$HY_TMP" "https://ghfast.top/$HY_URL" && verify_binary "$HY_TMP" "Hysteria 2 (Mirror)"; then
+    hy_ok=1
+  fi
+fi
+
+if [ "$hy_ok" -ne 1 ]; then
+  rm -f "$HY_TMP"
+  printf "%b错误: Hysteria 2 下载或校验失败%b\n" "$RED" "$PLAIN" >&2
+  exit 1
+fi
+mv "$HY_TMP" /usr/local/bin/hysteria
+
+XRAY_ASSET="Xray-linux-${XRAY_ARCH}.zip"
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/${XRAY_ASSET}"
+XRAY_ZIP="/tmp/xray.$$.zip" XRAY_DIR="/tmp/xray_extract.$$"
+rm -rf "$XRAY_ZIP" "$XRAY_DIR"
+mkdir -p "$XRAY_DIR"
+
+xray_ok=0
+if curl -fsSL --max-time 50 -o "$XRAY_ZIP" "$XRAY_URL" && [ -s "$XRAY_ZIP" ]; then
+  if unzip -qo "$XRAY_ZIP" -d "$XRAY_DIR" && [ -s "$XRAY_DIR/xray" ] && verify_binary "$XRAY_DIR/xray" "Xray-core"; then
+    xray_ok=1
+  fi
+elif [ "$ALLOW_MIRROR" -eq 1 ]; then
+  rm -f "$XRAY_ZIP"
+  if curl -fsSL --max-time 50 -o "$XRAY_ZIP" "https://ghfast.top/$XRAY_URL" && [ -s "$XRAY_ZIP" ]; then
+    if unzip -qo "$XRAY_ZIP" -d "$XRAY_DIR" && [ -s "$XRAY_DIR/xray" ] && verify_binary "$XRAY_DIR/xray" "Xray-core (Mirror)"; then
+      xray_ok=1
+    fi
+  fi
+fi
+
+INSTALL_VLESS=0
+if [ "$xray_ok" -eq 1 ]; then
+  mv "$XRAY_DIR/xray" /usr/local/bin/xray
+  INSTALL_VLESS=1
+else
+  printf "%b警告: Xray-core 下载或校验失败，将仅部署 Hysteria 2%b\n" "$YELLOW" "$PLAIN"
+fi
+rm -rf "$XRAY_ZIP" "$XRAY_DIR"
+
+# ===== [4/6] 校验 SNI 与生成配置 =====
+printf "%b[4/6] 校验 TLS 1.3 SNI 并生成配置...%b\n" "$YELLOW" "$PLAIN"
+SNI_CANDIDATES="www.microsoft.com www.apple.com www.amd.com www.oracle.com"
+OPTIMIZED_SNI="${OPTIMIZED_SNI:-www.microsoft.com}"
+BEST_TIME=9999
+
+for domain in $SNI_CANDIDATES; do
+  conn_time=$(curl -o /dev/null -s --tlsv1.3 -w '\%{time_connect}\n' --connect-timeout 2 -m 4 "https://$domain" 2>/dev/null || echo "999")
+  if printf "" | openssl s_client -tls1_3 -servername "$domain" -connect "${domain}:443" >/dev/null 2>&1; then
+    is_better=$(awk -v t="$conn_time" -v b="$BEST_TIME" 'BEGIN {if (t > 0 && t < b) print 1; else print 0}')
+    if [ "$is_better" = "1" ]; then
+      BEST_TIME="$conn_time"
+      OPTIMIZED_SNI="$domain"
+    fi
+  fi
+done
+
+if [ ! -s /etc/hysteria/key.key ] || [ ! -s /etc/hysteria/cert.crt ] || [ "$FORCE_OVERWRITE" -eq 1 ]; then
+  rm -f /etc/hysteria/key.key /etc/hysteria/cert.crt
+  openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key
+  openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650
+  chmod 600 /etc/hysteria/key.key
+  chmod 644 /etc/hysteria/cert.crt
+fi
+
+cat > /etc/hysteria/config.yaml <<EOF
+listen: :${PORT}
+auth:
+  type: password
+  password: ${HY_PASS}
+obfs:
+  type: gecko
+  gecko:
+    password: ${HY_OBFS_PASS}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${OPTIMIZED_SNI}
+    rewriteHost: true
+tls:
+  cert: /etc/hysteria/cert.crt
+  key: /etc/hysteria/key.key
+EOF
+chmod 600 /etc/hysteria/config.yaml
+
+if [ "$INSTALL_VLESS" -eq 1 ]; then
+  if [ -z "${VLESS_UUID:-}" ] \vert{}\vert{} [ -z "${VLESS_PRIV_KEY:-}" ] || [ -z "${VLESS_PUB_KEY:-}" ] \vert{}\vert{} [ "$FORCE_OVERWRITE" -eq 1 ]; then
+    VLESS_UUID=$(/usr/local/bin/xray uuid || true)
+    X25519_JSON=$(/usr/local/bin/xray x25519 -format=json 2>/dev/null || true)
+    VLESS_PRIV_KEY=""
+    VLESS_PUB_KEY=""
+
+    if [ -n "$X25519_JSON" ]; then
+      VLESS_PRIV_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"privateKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+      VLESS_PUB_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+      [ -z "$VLESS_PUB_KEY" ] && VLESS_PUB_KEY=$(printf '\%s' "$X25519_JSON" | sed -n 's/.*"publicKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    fi
+
+    if [ -z "$VLESS_PRIV_KEY" ] \vert{}\vert{} [ -z "$VLESS_PUB_KEY" ]; then
+      X25519_TXT=$(/usr/local/bin/xray x25519 2>/dev/null || true)
+      [ -z "$VLESS_PRIV_KEY" ] && VLESS_PRIV_KEY=$(printf '%s\n' "$X25519_TXT" \vert{} awk -F':' '/[Pp]rivate ?[Kk]ey/ {gsub(/^[[:space:]]+\vert{}[[:space:]]+$/, "", $2); print $2; exit}')
+      [ -z "$VLESS_PUB_KEY" ] &&
