@@ -47,7 +47,7 @@ fi
 
 apk update -q
 apk add --no-cache curl openssl 
-apk add --no-cache ccurl ca-certificates 
+apk add --no-cache curl ca-certificates 
 apk add --no-cache curl gawk 
 apk add --no-cache curl iproute2 
 apk add --no-cache curl unzip 
