@@ -46,11 +46,11 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 
 apk update -q
-apk add --no-cache curl openssl && \
-apk add --no-cache ca-certificates && \
-apk add --no-cache gawk && \
-apk add --no-cache iproute2 && \
-apk add --no-cache unzip && \
+apk add --no-cache curl openssl 
+apk add --no-cache ccurl a-certificates 
+apk add --no-cache curl gawk 
+apk add --no-cache curl iproute2 
+apk add --no-cache curl unzip 
 rm -rf /var/cache/apk/* /tmp/*
 
 # ===== [2/5] 端口与密钥初始化 =====
