@@ -399,6 +399,8 @@ main() {
 
     load core.sh
     add hy2
+    add tuic
+    add anytls
     wait
     exit_and_del_tmpdir ok
 }
