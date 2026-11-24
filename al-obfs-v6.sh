@@ -45,7 +45,13 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 
 apk update -q
-apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip
+apk update -q
+apk add --no-cache curl openssl 
+apk add --no-cache curl ca-certificates 
+apk add --no-cache curl gawk 
+apk add --no-cache curl iproute2 
+apk add --no-cache curl unzip 
+rm -rf /var/cache/apk/* /tmp/*
 
 # ===== [2/5] 端口与密钥初始化 =====
 echo -e "${YELLOW}[2/5] 正在初始化端口与安全密钥...${PLAIN}"
