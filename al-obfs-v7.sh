@@ -1,6 +1,4 @@
-已修復 Xray 新版 `x25519` 輸出格式解析問題（相容 `PrivateKey:` 與 `Password (PublicKey):` / `Password:` / `Public key:`），以下為完整版 `al-obfs-v7.sh` 腳本。
-
-```sh
+cat <<'EOF' > /root/al-obfs-v7.sh
 #!/bin/sh
 # =========================================================================
 # Hysteria 2 (UDP) + VLESS-REALITY (Xray TCP) Alpine 同端口双协议完整版脚本
@@ -247,5 +245,6 @@ echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${PORT}?insecure=1&sni=${OPTIMIZED
 echo -e "\n${YELLOW}[VLESS-REALITY 直连链接]:${PLAIN}"
 echo -e "${CYAN}vless://${VLESS_UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${OPTIMIZED_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#VLESS-REALITY-TCP-${PORT}${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
-
-```
+EOF
+chmod +x /root/al-obfs-v7.sh
+/root/al-obfs-v7.sh -p 23304 -i 91.238.123.88
