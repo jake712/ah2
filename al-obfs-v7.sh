@@ -1,7 +1,10 @@
+已修復 Xray 新版 `x25519` 輸出格式解析問題（相容 `PrivateKey:` 與 `Password (PublicKey):` / `Password:` / `Public key:`），以下為完整版 `al-obfs-v7.sh` 腳本。
+
+```sh
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 + VLESS-REALITY (Xray) Alpine 同端口双协议部署脚本
-# 协议分工: Hysteria 2 -> UDP:${PORT} | VLESS-REALITY -> TCP:${PORT}
+# Hysteria 2 (UDP) + VLESS-REALITY (Xray TCP) Alpine 同端口双协议完整版脚本
+# 适配: Alpine Linux 3.20/3.21/3.22+, Podman / Docker 容器及原生系统
 # =========================================================================
 
 set -e
@@ -88,7 +91,8 @@ chmod +x /usr/local/bin/$DISGUISE_HY
 
 # 2. 下载 Xray-core (用于 VLESS-REALITY)
 XRAY_ZIP_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_STR}.zip"
-rm -f /tmp/xray.zip /tmp/xray
+rm -f /tmp/xray.zip
+rm -rf /tmp/xray_extract
 for url in "$XRAY_ZIP_URL" "https://ghfast.top/$XRAY_ZIP_URL"; do
   curl -fsSL --max-time 30 -o /tmp/xray.zip "$url" && break
 done
@@ -103,7 +107,6 @@ rm -rf /tmp/xray_extract /tmp/xray.zip
 
 # ===== [4/5] 优选 SNI、生成密钥与写入配置 =====
 echo -e "${YELLOW}[4/5] 智能优选 REALITY 目标域名并生成配置...${PLAIN}"
-# REALITY 建议选择支持 TLS 1.3 且支持 X25519 的主流站点
 SNI_CANDIDATES="www.amd.com www.apple.com www.microsoft.com www.oracle.com www.cloudflare.com"
 OPTIMIZED_SNI="www.apple.com"
 LOWEST_LATENCY=9999
@@ -122,13 +125,14 @@ openssl ecparam -name prime256v1 -genkey -noout -out /etc/hysteria/key.key 2>/de
 openssl req -new -x509 -key /etc/hysteria/key.key -out /etc/hysteria/cert.crt -subj "/CN=${OPTIMIZED_SNI}" -days 3650 2>/dev/null
 chmod 600 /etc/hysteria/key.key
 
-# 生成 Xray REALITY x25519 密钥对
-X25519_OUT=$(/usr/local/bin/$DISGUISE_XRAY x25519)
-PRIVATE_KEY=$(echo "$X25519_OUT" | awk -F': ' '/Private key:/ {print $2}' | tr -d '[:space:]')
-PUBLIC_KEY=$(echo "$X25519_OUT" | awk -F': ' '/Public key:/ {print $2}' | tr -d '[:space:]')
+# 生成 Xray REALITY x25519 密钥对 (兼容新版 PrivateKey / Password (PublicKey) 与旧版格式)
+X25519_OUT=$(/usr/local/bin/$DISGUISE_XRAY x25519 2>/dev/null || true)
+PRIVATE_KEY=$(printf '%s\n' "$X25519_OUT" | awk -F':' '/^(PrivateKey|Private key):/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+PUBLIC_KEY=$(printf '%s\n' "$X25519_OUT" | awk -F':' '/^(Password \(PublicKey\)|Password|Public key):/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
 
 if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
   echo -e "${RED}错误: 生成 REALITY x25519 密钥失败${PLAIN}"
+  printf '%s\n' "$X25519_OUT"
   exit 1
 fi
 
@@ -243,3 +247,5 @@ echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${PORT}?insecure=1&sni=${OPTIMIZED
 echo -e "\n${YELLOW}[VLESS-REALITY 直连链接]:${PLAIN}"
 echo -e "${CYAN}vless://${VLESS_UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${OPTIMIZED_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#VLESS-REALITY-TCP-${PORT}${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
+
+```
