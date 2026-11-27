@@ -1,19 +1,22 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本（分离端口 + 无范围限制版）
-# 适用: Alpine Linux 3.20/3.21/3.22+ 原生系统 (容器内 OpenRC 不可用)
+# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本 (NAT VPS 专用版)
+# 适用: Alpine Linux 3.20+ (NAT VPS / LXC 容器均可, OpenRC 可用即可)
 #
-# 功能:
-#   [A] 初始部署时 hy2 / anytls 分别随机分配两个不同端口 (默认池 40000-60000,
-#       仅用于自动分配; 分别检查 UDP / TCP 占用, 两端口保证不相同)
-#   [B] 手动指定 (-p/-t) 与 hys set 不限制端口范围, 仅要求纯数字;
-#       两协议端口不得相同, 且新端口必须当前空闲
-#   [C] 配置持久化到 /etc/hysteria/info.env (HY_PORT 与 ATLS_PORT 独立)
-#   [D] AnyTLS OpenRC 服务单元动态读取 info.env
-#   [E] hys 管理命令:
-#       hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
-#       hys set anytls <port>   只修改 AnyTLS (TCP) 端口
-#       hys newpass / newobfs / info / start / stop / restart / status
+# NAT VPS 适配:
+#   [A] 已移除全部端口扫描逻辑 (无 ss 占用检查 / 无兜底扫描),
+#       连带不再安装 iproute2 / gawk, 依赖更精简
+#   [B] 端口分配规则: hy2 与 anytls 端口保证不同, 仅此一条
+#   [C] -p / -t 可选: 不指定则自动随机分配 (默认池见下方配置区);
+#       NAT VPS 请确保端口落在服务商转发范围内, 不在范围内时
+#       用 -p/-t 指定, 或部署后用 hys set 修改
+#   [D] 公网 IP 自动检测返回的是共享 IP (即客户端实际连接的 IP)
+#
+# 注意:
+#   - Hysteria2 (UDP) 要求服务商转发规则包含 UDP; 部分 NAT VPS 仅转发 TCP,
+#     若 hy2 连不上请先确认 UDP 转发
+#   - 无占用扫描: 若所选端口恰好在容器内部被占用, 服务会启动失败,
+#     用 hys status / 日志排查后 hys set 换端口即可
 # =========================================================================
 
 set -e
@@ -31,10 +34,10 @@ while getopts "p:t:i:h" opt; do
     i) CUSTOM_IP=$OPTARG ;;
     h)
       echo "用法: $0 [选项]"
-      echo "  -p <端口>   自定义 Hysteria2 (UDP) 端口 (不限制范围, 默认在 40000-60000 随机)"
-      echo "  -t <端口>   自定义 AnyTLS (TCP) 端口   (不限制范围, 默认在 40000-60000 随机)"
-      echo "  -i <公网IP> 手动指定服务器公网 IP"
-      echo "注: 两个端口必须不同, 且所选端口当前必须空闲"
+      echo "  -p <端口>   自定义 Hysteria2 (UDP) 端口 (可选, 不指定则自动分配)"
+      echo "  -t <端口>   自定义 AnyTLS (TCP) 端口   (可选, 不指定则自动分配)"
+      echo "  -i <公网IP> 手动指定服务器公网 IP (NAT VPS 通常自动检测即共享 IP, 可不填)"
+      echo "注: NAT VPS 请确保端口在服务商转发范围内, 两端口必须不同"
       exit 0
       ;;
   esac
@@ -45,7 +48,7 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 (Gecko) + AnyTLS (分离端口版) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 (Gecko) + AnyTLS (NAT VPS 版) ===${PLAIN}"
 
 # ===== [1/7] 基础环境与依赖 =====
 echo -e "${YELLOW}[1/7] 检查并配置系统环境...${PLAIN}"
@@ -61,41 +64,38 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 
 apk update -q
-apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip openrc
+apk add --no-cache curl openssl ca-certificates unzip openrc
 
-# ===== [2/7] 分离端口与密钥初始化 =====
-echo -e "${YELLOW}[2/7] 正在初始化分离端口与安全密钥...${PLAIN}"
+# ===== [2/7] 端口分配 (无扫描, 仅保证两端口不同) =====
+echo -e "${YELLOW}[2/7] 正在初始化端口与安全密钥...${PLAIN}"
 
-# 随机默认池 (仅用于自动分配, 不构成校验限制)
+# ---- NAT VPS 配置区 ----
+# 使用自动分配时, 若此默认池与服务商转发范围不符, 请修改为转发范围,
+# 例如服务商转发 30000-50000, 则改为 PORT_POOL_START=30000 / PORT_POOL_END=50000
+PORT_POOL_START=40000
+PORT_POOL_END=60000
+# ------------------------
+
+# 随机端口: /dev/urandom + cksum (均为 busybox 核心工具, 无 srand 秒级种子问题)
 rand_port() {
-  awk 'BEGIN{srand(); print int(rand()*(60000-40000+1))+40000}'
-}
-
-# 端口占用检查: $1=udp|tcp $2=端口; 返回 0=被占用 1=空闲
-# 注意: ss -Huln / -Htln 的本地地址均在第 4 列
-port_in_use() {
-  case "$1" in
-    udp) ss -Huln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" ;;
-    tcp) ss -Htln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" ;;
+  R_RP=$(head -c 4 /dev/urandom 2>/dev/null | cksum | awk '{print $1}')
+  case "$R_RP" in
+    ''|*[!0-9]*) R_RP=0 ;;
   esac
+  echo $(( (R_RP % (PORT_POOL_END - PORT_POOL_START + 1)) + PORT_POOL_START ))
 }
 
-# 在默认池内随机挑选一个空闲端口, 排除 $2 (可为空); 失败返回 1
-gen_free_port() {
-  PROTO_GFP=$1
-  EXCLUDE_GFP=$2
-  TRY_GFP=0
-  while [ $TRY_GFP -lt 100 ]; do
-    P_GFP=$(rand_port)
-    if [ -n "$EXCLUDE_GFP" ] && [ "$P_GFP" = "$EXCLUDE_GFP" ]; then
-      TRY_GFP=$((TRY_GFP+1))
-      continue
-    fi
-    if ! port_in_use "$PROTO_GFP" "$P_GFP"; then
-      echo "$P_GFP"
+# 生成一个与 $1 (可为空) 不同的随机端口, 不做任何占用扫描
+gen_distinct_port() {
+  EXCLUDE_GDP=$1
+  TRY_GDP=0
+  while [ $TRY_GDP -lt 100 ]; do
+    P_GDP=$(rand_port)
+    if [ -z "$EXCLUDE_GDP" ] || [ "$P_GDP" != "$EXCLUDE_GDP" ]; then
+      echo "$P_GDP"
       return 0
     fi
-    TRY_GFP=$((TRY_GFP+1))
+    TRY_GDP=$((TRY_GDP+1))
   done
   return 1
 }
@@ -114,14 +114,10 @@ validate_port() {
 # --- Hysteria2 (UDP) 端口 ---
 if [ -n "$CUSTOM_HY_PORT" ]; then
   validate_port "$CUSTOM_HY_PORT" || exit 1
-  if port_in_use udp "$CUSTOM_HY_PORT"; then
-    echo -e "${RED}错误: UDP 端口 ${CUSTOM_HY_PORT} 已被其他进程占用${PLAIN}"
-    exit 1
-  fi
   HY_PORT=$CUSTOM_HY_PORT
   echo -e "${CYAN}✔ Hysteria2 使用指定端口: ${HY_PORT} (UDP)${PLAIN}"
 else
-  HY_PORT=$(gen_free_port udp "") || { echo -e "${RED}错误: 默认池内找不到空闲 UDP 端口${PLAIN}"; exit 1; }
+  HY_PORT=$(gen_distinct_port "") || { echo -e "${RED}错误: 端口分配失败, 请用 -p 手动指定${PLAIN}"; exit 1; }
   echo -e "${CYAN}✔ Hysteria2 已自动分配端口: ${HY_PORT} (UDP)${PLAIN}"
 fi
 
@@ -132,18 +128,15 @@ if [ -n "$CUSTOM_ATLS_PORT" ]; then
     echo -e "${RED}错误: AnyTLS 端口不能与 Hysteria2 端口相同${PLAIN}"
     exit 1
   fi
-  if port_in_use tcp "$CUSTOM_ATLS_PORT"; then
-    echo -e "${RED}错误: TCP 端口 ${CUSTOM_ATLS_PORT} 已被其他进程占用${PLAIN}"
-    exit 1
-  fi
   ATLS_PORT=$CUSTOM_ATLS_PORT
   echo -e "${CYAN}✔ AnyTLS 使用指定端口: ${ATLS_PORT} (TCP)${PLAIN}"
 else
-  ATLS_PORT=$(gen_free_port tcp "$HY_PORT") || { echo -e "${RED}错误: 默认池内找不到与 hy2 不同的空闲 TCP 端口${PLAIN}"; exit 1; }
+  ATLS_PORT=$(gen_distinct_port "$HY_PORT") || { echo -e "${RED}错误: 端口分配失败, 请用 -t 手动指定${PLAIN}"; exit 1; }
   echo -e "${CYAN}✔ AnyTLS 已自动分配端口: ${ATLS_PORT} (TCP)${PLAIN}"
 fi
 
-echo -e "${GREEN}✔ 端口分离确认: hy2=${HY_PORT}/UDP, anytls=${ATLS_PORT}/TCP${PLAIN}"
+echo -e "${GREEN}✔ 端口确认: hy2=${HY_PORT}/UDP, anytls=${ATLS_PORT}/TCP${PLAIN}"
+echo -e "${YELLOW}提醒: 请确认这两个端口已在 NAT VPS 服务商转发规则中放行 (hy2 需 UDP)${PLAIN}"
 
 HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
 HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
@@ -198,7 +191,7 @@ if [ "$INSTALL_ATLS" != "1" ]; then
   echo -e "${YELLOW}提示: AnyTLS 核心未能成功下载，将仅部署 Hysteria 2${PLAIN}"
 fi
 
-# ===== [4/7] 内核 UDP 缓冲区调优 =====
+# ===== [4/7] 内核 UDP 缓冲区调优 (LXC 内可能受限, 失败不影响部署) =====
 echo -e "${YELLOW}[4/7] 调整内核 UDP 缓冲区参数...${PLAIN}"
 cat > /etc/sysctl.d/99-hysteria.conf <<'EOF'
 net.core.rmem_max=16777216
@@ -206,7 +199,7 @@ net.core.wmem_max=16777216
 net.ipv4.udp_mem=1048576 2097152 4194304
 EOF
 sysctl -p /etc/sysctl.d/99-hysteria.conf 2>/dev/null || \
-  echo -e "${YELLOW}提示: 内核参数应用失败 (容器内受限), 已写入 /etc/sysctl.d/99-hysteria.conf${PLAIN}"
+  echo -e "${YELLOW}提示: 内核参数应用失败 (NAT/LXC 容器内常见), 已写入 /etc/sysctl.d/99-hysteria.conf${PLAIN}"
 
 # ===== [5/7] 优选 SNI 并生成证书与配置 =====
 echo -e "${YELLOW}[5/7] 智能优选 SNI 并生成证书与配置...${PLAIN}"
@@ -290,7 +283,7 @@ depend() {
 EOF
 chmod +x /etc/init.d/hysteria2
 
-# AnyTLS OpenRC 服务单元 (动态 source info.env, 使用独立的 ATLS_PORT)
+# AnyTLS OpenRC 服务单元 (动态 source info.env)
 if [ "$INSTALL_ATLS" = "1" ]; then
   cat > /etc/init.d/anytls <<'EOF'
 #!/sbin/openrc-run
@@ -314,11 +307,11 @@ EOF
   chmod +x /etc/init.d/anytls
 fi
 
-# 安装 hys 管理命令
+# 安装 hys 管理命令 (无占用扫描版)
 cat > /usr/local/bin/hys <<'HYSEOF'
 #!/bin/sh
 # =========================================================================
-# hys - Hysteria2 + AnyTLS 一站式管理命令 (分离端口 + 无范围限制版)
+# hys - Hysteria2 + AnyTLS 一站式管理命令 (NAT VPS 版, 无端口扫描)
 #   hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
 #   hys set anytls <port>   只修改 AnyTLS (TCP) 端口
 #   hys newpass             重新生成 Hysteria2 认证密码
@@ -327,7 +320,8 @@ cat > /usr/local/bin/hys <<'HYSEOF'
 #   hys start|stop|restart|status
 #   hys help
 #
-# 端口不限制范围, 仅要求纯数字; 两协议端口不得相同, 且新端口必须空闲
+# 端口不限制范围, 仅要求纯数字; 两协议端口不得相同;
+# NAT VPS 请使用服务商转发范围内的端口
 # =========================================================================
 
 INFO_ENV=/etc/hysteria/info.env
@@ -351,8 +345,8 @@ print_help() {
   cat <<'HEOF'
 用法: hys <子命令> [参数]
 
-  set hy2 <port>      只修改 Hysteria2 (UDP) 端口 (不限制范围)
-  set anytls <port>   只修改 AnyTLS (TCP) 端口 (不限制范围)
+  set hy2 <port>      只修改 Hysteria2 (UDP) 端口
+  set anytls <port>   只修改 AnyTLS (TCP) 端口
   newpass             重新生成 Hysteria2 认证密码
   newobfs             重新生成 Hysteria2 混淆密码
   info                显示当前配置与分享链接
@@ -362,8 +356,8 @@ print_help() {
   status              查看服务运行状态
   help                显示本帮助
 
-注: 端口不限制范围, 仅要求纯数字;
-    两协议端口不得相同, 且新端口当前必须空闲
+注: 端口仅要求纯数字, 两协议端口不得相同;
+    NAT VPS 请使用服务商转发范围内的端口 (hy2 需 UDP 转发)
 HEOF
 }
 
@@ -377,18 +371,9 @@ validate_port() {
   return 0
 }
 
-# 端口占用检查: $1=udp|tcp $2=端口; 返回 0=空闲 1=被占
-check_port_free() {
-  case "$1" in
-    udp) ss -Huln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" && return 1 ;;
-    tcp) ss -Htln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" && return 1 ;;
-  esac
-  return 0
-}
-
 print_links() {
   echo ""
-  echo -e "${GREEN}=== 当前配置 (分离端口) ===${PLAIN}"
+  echo -e "${GREEN}=== 当前配置 ===${PLAIN}"
   echo -e " 服务器地址    : ${CYAN}${SERVER_IP}${PLAIN}"
   echo -e " Hy2 端口     : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
   echo -e " AnyTLS 端口  : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
@@ -416,10 +401,6 @@ do_set_hy2() {
     echo -e "${RED}错误: 端口 ${NEW_PORT} 是 AnyTLS 当前端口, 两协议端口不得相同${PLAIN}"
     return 1
   fi
-  if ! check_port_free udp "$NEW_PORT"; then
-    echo -e "${RED}错误: UDP 端口 ${NEW_PORT} 已被其他进程占用${PLAIN}"
-    return 1
-  fi
   sed -i "s|^listen:.*|listen: :${NEW_PORT}|" "$HY_CONFIG"
   sed -i "s|^HY_PORT=.*|HY_PORT=${NEW_PORT}|" "$INFO_ENV"
   rc-service hysteria2 restart >/dev/null 2>&1
@@ -440,10 +421,6 @@ do_set_anytls() {
   fi
   if [ "$NEW_PORT" = "$HY_PORT" ]; then
     echo -e "${RED}错误: 端口 ${NEW_PORT} 是 Hysteria2 当前端口, 两协议端口不得相同${PLAIN}"
-    return 1
-  fi
-  if ! check_port_free tcp "$NEW_PORT"; then
-    echo -e "${RED}错误: TCP 端口 ${NEW_PORT} 已被其他进程占用${PLAIN}"
     return 1
   fi
   sed -i "s|^ATLS_PORT=.*|ATLS_PORT=${NEW_PORT}|" "$INFO_ENV"
@@ -550,7 +527,7 @@ rc-service hysteria2 status || true
 [ "$INSTALL_ATLS" = "1" ] && rc-service anytls status || true
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
-echo -e "${GREEN}🎉 双协议部署成功！(分离端口模式)${PLAIN}"
+echo -e "${GREEN}🎉 双协议部署成功！(NAT VPS / 分离端口)${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e " 📍 服务器地址        : ${CYAN}${SERVER_IP}${PLAIN}"
 echo -e " 🔢 Hysteria2 端口    : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
@@ -574,12 +551,13 @@ if [ "$INSTALL_ATLS" = "1" ]; then
   echo -e "${CYAN}anytls://${ATLS_PASS}@${SERVER_IP}:${ATLS_PORT}?sni=${OPTIMIZED_SNI}&insecure=1#AnyTLS${PLAIN}"
 fi
 echo -e "${GREEN}================================================================${PLAIN}"
+echo -e "${YELLOW}[NAT VPS 检查清单]${PLAIN}"
+echo -e "  1. 确认服务商转发规则已放行 ${HY_PORT}/UDP 与 ${ATLS_PORT}/TCP"
+echo -e "  2. 若随机端口不在转发范围, 用 hys set 改到转发范围内"
+echo -e "  3. hy2 连不上时优先确认服务商是否转发 UDP"
 echo -e "${YELLOW}[后续管理命令]${PLAIN}"
-echo -e "  hys set hy2 8443       # 只改 Hysteria2 (UDP) 端口, 任意数字"
-echo -e "  hys set anytls 8443    # 只改 AnyTLS (TCP) 端口, 任意数字"
+echo -e "  hys set hy2 <端口>     # 只改 Hysteria2 (UDP) 端口"
+echo -e "  hys set anytls <端口>  # 只改 AnyTLS (TCP) 端口"
 echo -e "  hys info               # 查看当前配置与分享链接"
-echo -e "  hys newpass            # 重生成 Hysteria2 认证密码"
-echo -e "  hys newobfs            # 重生成 Hysteria2 混淆密码"
-echo -e "  hys restart            # 重启服务"
-echo -e "  hys status             # 查看服务状态"
+echo -e "  hys restart / status   # 重启 / 状态"
 echo -e "${GREEN}================================================================${PLAIN}"
