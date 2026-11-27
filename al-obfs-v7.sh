@@ -1,18 +1,19 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本（分离端口版）
+# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本（分离端口 + 无范围限制版）
 # 适用: Alpine Linux 3.20/3.21/3.22+ 原生系统 (容器内 OpenRC 不可用)
 #
 # 功能:
-#   [A] 初始部署时 hy2 / anytls 分别随机分配两个不同端口 (均在 40000-60000,
-#       分别检查 UDP / TCP 占用, 两端口保证不相同)
-#   [B] 配置持久化到 /etc/hysteria/info.env (HY_PORT 与 ATLS_PORT 独立)
-#   [C] AnyTLS OpenRC 服务单元动态读取 info.env
-#   [D] hys 管理命令 (同端口模式已移除):
+#   [A] 初始部署时 hy2 / anytls 分别随机分配两个不同端口 (默认池 40000-60000,
+#       仅用于自动分配; 分别检查 UDP / TCP 占用, 两端口保证不相同)
+#   [B] 手动指定 (-p/-t) 与 hys set 不限制端口范围, 仅要求纯数字;
+#       两协议端口不得相同, 且新端口必须当前空闲
+#   [C] 配置持久化到 /etc/hysteria/info.env (HY_PORT 与 ATLS_PORT 独立)
+#   [D] AnyTLS OpenRC 服务单元动态读取 info.env
+#   [E] hys 管理命令:
 #       hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
 #       hys set anytls <port>   只修改 AnyTLS (TCP) 端口
 #       hys newpass / newobfs / info / start / stop / restart / status
-#   [E] 端口范围强制 40000-60000
 # =========================================================================
 
 set -e
@@ -30,10 +31,10 @@ while getopts "p:t:i:h" opt; do
     i) CUSTOM_IP=$OPTARG ;;
     h)
       echo "用法: $0 [选项]"
-      echo "  -p <端口>   自定义 Hysteria2 (UDP) 端口 (默认在 40000-60000 随机)"
-      echo "  -t <端口>   自定义 AnyTLS (TCP) 端口   (默认在 40000-60000 随机)"
+      echo "  -p <端口>   自定义 Hysteria2 (UDP) 端口 (不限制范围, 默认在 40000-60000 随机)"
+      echo "  -t <端口>   自定义 AnyTLS (TCP) 端口   (不限制范围, 默认在 40000-60000 随机)"
       echo "  -i <公网IP> 手动指定服务器公网 IP"
-      echo "注: 两个端口必须不同 (本版已移除同端口模式)"
+      echo "注: 两个端口必须不同, 且所选端口当前必须空闲"
       exit 0
       ;;
   esac
@@ -65,6 +66,7 @@ apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip openrc
 # ===== [2/7] 分离端口与密钥初始化 =====
 echo -e "${YELLOW}[2/7] 正在初始化分离端口与安全密钥...${PLAIN}"
 
+# 随机默认池 (仅用于自动分配, 不构成校验限制)
 rand_port() {
   awk 'BEGIN{srand(); print int(rand()*(60000-40000+1))+40000}'
 }
@@ -78,7 +80,7 @@ port_in_use() {
   esac
 }
 
-# 在 40000-60000 内随机挑选一个空闲端口, 排除 $2 (可为空); 失败返回 1
+# 在默认池内随机挑选一个空闲端口, 排除 $2 (可为空); 失败返回 1
 gen_free_port() {
   PROTO_GFP=$1
   EXCLUDE_GFP=$2
@@ -98,23 +100,20 @@ gen_free_port() {
   return 1
 }
 
-validate_port_range() {
+# 端口校验: 仅要求纯数字, 不限制范围
+validate_port() {
   case "$1" in
     ''|*[!0-9]*)
       echo -e "${RED}错误: 端口必须是纯数字${PLAIN}"
       return 1
       ;;
   esac
-  if [ "$1" -lt 40000 ] || [ "$1" -gt 60000 ]; then
-    echo -e "${RED}错误: 端口必须在 40000-60000 范围内${PLAIN}"
-    return 1
-  fi
   return 0
 }
 
 # --- Hysteria2 (UDP) 端口 ---
 if [ -n "$CUSTOM_HY_PORT" ]; then
-  validate_port_range "$CUSTOM_HY_PORT" || exit 1
+  validate_port "$CUSTOM_HY_PORT" || exit 1
   if port_in_use udp "$CUSTOM_HY_PORT"; then
     echo -e "${RED}错误: UDP 端口 ${CUSTOM_HY_PORT} 已被其他进程占用${PLAIN}"
     exit 1
@@ -122,15 +121,15 @@ if [ -n "$CUSTOM_HY_PORT" ]; then
   HY_PORT=$CUSTOM_HY_PORT
   echo -e "${CYAN}✔ Hysteria2 使用指定端口: ${HY_PORT} (UDP)${PLAIN}"
 else
-  HY_PORT=$(gen_free_port udp "") || { echo -e "${RED}错误: 40000-60000 内找不到空闲 UDP 端口${PLAIN}"; exit 1; }
+  HY_PORT=$(gen_free_port udp "") || { echo -e "${RED}错误: 默认池内找不到空闲 UDP 端口${PLAIN}"; exit 1; }
   echo -e "${CYAN}✔ Hysteria2 已自动分配端口: ${HY_PORT} (UDP)${PLAIN}"
 fi
 
 # --- AnyTLS (TCP) 端口 (必须与 HY_PORT 不同) ---
 if [ -n "$CUSTOM_ATLS_PORT" ]; then
-  validate_port_range "$CUSTOM_ATLS_PORT" || exit 1
+  validate_port "$CUSTOM_ATLS_PORT" || exit 1
   if [ "$CUSTOM_ATLS_PORT" = "$HY_PORT" ]; then
-    echo -e "${RED}错误: AnyTLS 端口不能与 Hysteria2 端口相同 (本版已移除同端口模式)${PLAIN}"
+    echo -e "${RED}错误: AnyTLS 端口不能与 Hysteria2 端口相同${PLAIN}"
     exit 1
   fi
   if port_in_use tcp "$CUSTOM_ATLS_PORT"; then
@@ -140,7 +139,7 @@ if [ -n "$CUSTOM_ATLS_PORT" ]; then
   ATLS_PORT=$CUSTOM_ATLS_PORT
   echo -e "${CYAN}✔ AnyTLS 使用指定端口: ${ATLS_PORT} (TCP)${PLAIN}"
 else
-  ATLS_PORT=$(gen_free_port tcp "$HY_PORT") || { echo -e "${RED}错误: 40000-60000 内找不到与 hy2 不同的空闲 TCP 端口${PLAIN}"; exit 1; }
+  ATLS_PORT=$(gen_free_port tcp "$HY_PORT") || { echo -e "${RED}错误: 默认池内找不到与 hy2 不同的空闲 TCP 端口${PLAIN}"; exit 1; }
   echo -e "${CYAN}✔ AnyTLS 已自动分配端口: ${ATLS_PORT} (TCP)${PLAIN}"
 fi
 
@@ -315,11 +314,11 @@ EOF
   chmod +x /etc/init.d/anytls
 fi
 
-# 安装 hys 管理命令 (同端口模式已移除)
+# 安装 hys 管理命令
 cat > /usr/local/bin/hys <<'HYSEOF'
 #!/bin/sh
 # =========================================================================
-# hys - Hysteria2 + AnyTLS 一站式管理命令 (分离端口版)
+# hys - Hysteria2 + AnyTLS 一站式管理命令 (分离端口 + 无范围限制版)
 #   hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
 #   hys set anytls <port>   只修改 AnyTLS (TCP) 端口
 #   hys newpass             重新生成 Hysteria2 认证密码
@@ -328,7 +327,7 @@ cat > /usr/local/bin/hys <<'HYSEOF'
 #   hys start|stop|restart|status
 #   hys help
 #
-# 端口范围强制 40000-60000, 且两协议端口不得相同
+# 端口不限制范围, 仅要求纯数字; 两协议端口不得相同, 且新端口必须空闲
 # =========================================================================
 
 INFO_ENV=/etc/hysteria/info.env
@@ -352,8 +351,8 @@ print_help() {
   cat <<'HEOF'
 用法: hys <子命令> [参数]
 
-  set hy2 <port>      只修改 Hysteria2 (UDP) 端口 (40000-60000)
-  set anytls <port>   只修改 AnyTLS (TCP) 端口 (40000-60000)
+  set hy2 <port>      只修改 Hysteria2 (UDP) 端口 (不限制范围)
+  set anytls <port>   只修改 AnyTLS (TCP) 端口 (不限制范围)
   newpass             重新生成 Hysteria2 认证密码
   newobfs             重新生成 Hysteria2 混淆密码
   info                显示当前配置与分享链接
@@ -363,7 +362,8 @@ print_help() {
   status              查看服务运行状态
   help                显示本帮助
 
-注: 端口范围强制 40000-60000, 且两协议端口不得相同 (同端口模式已移除)
+注: 端口不限制范围, 仅要求纯数字;
+    两协议端口不得相同, 且新端口当前必须空闲
 HEOF
 }
 
@@ -374,10 +374,6 @@ validate_port() {
       return 1
       ;;
   esac
-  if [ "$1" -lt 40000 ] || [ "$1" -gt 60000 ]; then
-    echo -e "${RED}错误: 端口必须在 40000-60000 范围内${PLAIN}"
-    return 1
-  fi
   return 0
 }
 
@@ -579,8 +575,8 @@ if [ "$INSTALL_ATLS" = "1" ]; then
 fi
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e "${YELLOW}[后续管理命令]${PLAIN}"
-echo -e "  hys set hy2 51234      # 只改 Hysteria2 (UDP) 端口"
-echo -e "  hys set anytls 51567   # 只改 AnyTLS (TCP) 端口"
+echo -e "  hys set hy2 8443       # 只改 Hysteria2 (UDP) 端口, 任意数字"
+echo -e "  hys set anytls 8443    # 只改 AnyTLS (TCP) 端口, 任意数字"
 echo -e "  hys info               # 查看当前配置与分享链接"
 echo -e "  hys newpass            # 重生成 Hysteria2 认证密码"
 echo -e "  hys newobfs            # 重生成 Hysteria2 混淆密码"
