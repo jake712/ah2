@@ -1,36 +1,39 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本（独立端口 + hys 管理命令版）
+# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本（分离端口版）
 # 适用: Alpine Linux 3.20/3.21/3.22+ 原生系统 (容器内 OpenRC 不可用)
 #
 # 功能:
-#   [A] 初始端口在 40000-60000 随机分配, hy2/anytls 默认共用
-#   [B] 配置持久化到 /etc/hysteria/info.env (HY_PORT 与 ATLS_PORT 分离)
+#   [A] 初始部署时 hy2 / anytls 分别随机分配两个不同端口 (均在 40000-60000,
+#       分别检查 UDP / TCP 占用, 两端口保证不相同)
+#   [B] 配置持久化到 /etc/hysteria/info.env (HY_PORT 与 ATLS_PORT 独立)
 #   [C] AnyTLS OpenRC 服务单元动态读取 info.env
-#   [D] hys 管理命令:
-#       hys set <port>          同时修改 hy2 + anytls 端口
+#   [D] hys 管理命令 (同端口模式已移除):
 #       hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
 #       hys set anytls <port>   只修改 AnyTLS (TCP) 端口
-#       hys set both <port>     同 hys set <port>
 #       hys newpass / newobfs / info / start / stop / restart / status
-#   [E] hys set 内置端口占用预检 (按 UDP/TCP 协议分别检查)
+#   [E] 端口范围强制 40000-60000
 # =========================================================================
 
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; PLAIN='\033[0m'
 
-CUSTOM_PORT=""
+CUSTOM_HY_PORT=""
+CUSTOM_ATLS_PORT=""
 CUSTOM_IP=""
 
-while getopts "p:i:h" opt; do
+while getopts "p:t:i:h" opt; do
   case $opt in
-    p) CUSTOM_PORT=$OPTARG ;;
+    p) CUSTOM_HY_PORT=$OPTARG ;;
+    t) CUSTOM_ATLS_PORT=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
     h)
       echo "用法: $0 [选项]"
-      echo "  -p <端口>   自定义监听端口 (默认在 40000-60000 随机, hy2/anytls 共用)"
+      echo "  -p <端口>   自定义 Hysteria2 (UDP) 端口 (默认在 40000-60000 随机)"
+      echo "  -t <端口>   自定义 AnyTLS (TCP) 端口   (默认在 40000-60000 随机)"
       echo "  -i <公网IP> 手动指定服务器公网 IP"
+      echo "注: 两个端口必须不同 (本版已移除同端口模式)"
       exit 0
       ;;
   esac
@@ -41,7 +44,7 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
-echo -e "${GREEN}=== 开始部署 Hysteria 2 (Gecko) + AnyTLS (独立端口管理版) ===${PLAIN}"
+echo -e "${GREEN}=== 开始部署 Hysteria 2 (Gecko) + AnyTLS (分离端口版) ===${PLAIN}"
 
 # ===== [1/7] 基础环境与依赖 =====
 echo -e "${YELLOW}[1/7] 检查并配置系统环境...${PLAIN}"
@@ -59,19 +62,89 @@ fi
 apk update -q
 apk add --no-cache curl openssl ca-certificates gawk iproute2 unzip openrc
 
-# ===== [2/7] 端口与密钥初始化 =====
-echo -e "${YELLOW}[2/7] 正在初始化端口与安全密钥...${PLAIN}"
-if [ -n "$CUSTOM_PORT" ]; then
-  PORT=$CUSTOM_PORT
-  echo -e "${CYAN}✔ 使用用户指定的端口: ${PORT}${PLAIN}"
+# ===== [2/7] 分离端口与密钥初始化 =====
+echo -e "${YELLOW}[2/7] 正在初始化分离端口与安全密钥...${PLAIN}"
+
+rand_port() {
+  awk 'BEGIN{srand(); print int(rand()*(60000-40000+1))+40000}'
+}
+
+# 端口占用检查: $1=udp|tcp $2=端口; 返回 0=被占用 1=空闲
+# 注意: ss -Huln / -Htln 的本地地址均在第 4 列
+port_in_use() {
+  case "$1" in
+    udp) ss -Huln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" ;;
+    tcp) ss -Htln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" ;;
+  esac
+}
+
+# 在 40000-60000 内随机挑选一个空闲端口, 排除 $2 (可为空); 失败返回 1
+gen_free_port() {
+  PROTO_GFP=$1
+  EXCLUDE_GFP=$2
+  TRY_GFP=0
+  while [ $TRY_GFP -lt 100 ]; do
+    P_GFP=$(rand_port)
+    if [ -n "$EXCLUDE_GFP" ] && [ "$P_GFP" = "$EXCLUDE_GFP" ]; then
+      TRY_GFP=$((TRY_GFP+1))
+      continue
+    fi
+    if ! port_in_use "$PROTO_GFP" "$P_GFP"; then
+      echo "$P_GFP"
+      return 0
+    fi
+    TRY_GFP=$((TRY_GFP+1))
+  done
+  return 1
+}
+
+validate_port_range() {
+  case "$1" in
+    ''|*[!0-9]*)
+      echo -e "${RED}错误: 端口必须是纯数字${PLAIN}"
+      return 1
+      ;;
+  esac
+  if [ "$1" -lt 40000 ] || [ "$1" -gt 60000 ]; then
+    echo -e "${RED}错误: 端口必须在 40000-60000 范围内${PLAIN}"
+    return 1
+  fi
+  return 0
+}
+
+# --- Hysteria2 (UDP) 端口 ---
+if [ -n "$CUSTOM_HY_PORT" ]; then
+  validate_port_range "$CUSTOM_HY_PORT" || exit 1
+  if port_in_use udp "$CUSTOM_HY_PORT"; then
+    echo -e "${RED}错误: UDP 端口 ${CUSTOM_HY_PORT} 已被其他进程占用${PLAIN}"
+    exit 1
+  fi
+  HY_PORT=$CUSTOM_HY_PORT
+  echo -e "${CYAN}✔ Hysteria2 使用指定端口: ${HY_PORT} (UDP)${PLAIN}"
 else
-  PORT=$(awk 'BEGIN{srand(); print int(rand()*(60000-40000+1))+40000}')
-  echo -e "${CYAN}✔ 已在 40000-60000 范围内自动分配端口: ${PORT}${PLAIN}"
+  HY_PORT=$(gen_free_port udp "") || { echo -e "${RED}错误: 40000-60000 内找不到空闲 UDP 端口${PLAIN}"; exit 1; }
+  echo -e "${CYAN}✔ Hysteria2 已自动分配端口: ${HY_PORT} (UDP)${PLAIN}"
 fi
 
-# 初始同端口模式, 后期可用 hys set hy2/anytls 拆开
-HY_PORT=$PORT
-ATLS_PORT=$PORT
+# --- AnyTLS (TCP) 端口 (必须与 HY_PORT 不同) ---
+if [ -n "$CUSTOM_ATLS_PORT" ]; then
+  validate_port_range "$CUSTOM_ATLS_PORT" || exit 1
+  if [ "$CUSTOM_ATLS_PORT" = "$HY_PORT" ]; then
+    echo -e "${RED}错误: AnyTLS 端口不能与 Hysteria2 端口相同 (本版已移除同端口模式)${PLAIN}"
+    exit 1
+  fi
+  if port_in_use tcp "$CUSTOM_ATLS_PORT"; then
+    echo -e "${RED}错误: TCP 端口 ${CUSTOM_ATLS_PORT} 已被其他进程占用${PLAIN}"
+    exit 1
+  fi
+  ATLS_PORT=$CUSTOM_ATLS_PORT
+  echo -e "${CYAN}✔ AnyTLS 使用指定端口: ${ATLS_PORT} (TCP)${PLAIN}"
+else
+  ATLS_PORT=$(gen_free_port tcp "$HY_PORT") || { echo -e "${RED}错误: 40000-60000 内找不到与 hy2 不同的空闲 TCP 端口${PLAIN}"; exit 1; }
+  echo -e "${CYAN}✔ AnyTLS 已自动分配端口: ${ATLS_PORT} (TCP)${PLAIN}"
+fi
+
+echo -e "${GREEN}✔ 端口分离确认: hy2=${HY_PORT}/UDP, anytls=${ATLS_PORT}/TCP${PLAIN}"
 
 HY_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
 HY_OBFS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
@@ -242,20 +315,20 @@ EOF
   chmod +x /etc/init.d/anytls
 fi
 
-# 安装 hys 管理命令
+# 安装 hys 管理命令 (同端口模式已移除)
 cat > /usr/local/bin/hys <<'HYSEOF'
 #!/bin/sh
 # =========================================================================
-# hys - Hysteria2 + AnyTLS 一站式管理命令
-#   hys set <port>          同时修改 hy2 + anytls 端口 (同端口模式)
+# hys - Hysteria2 + AnyTLS 一站式管理命令 (分离端口版)
 #   hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
 #   hys set anytls <port>   只修改 AnyTLS (TCP) 端口
-#   hys set both <port>     同 hys set <port>
 #   hys newpass             重新生成 Hysteria2 认证密码
 #   hys newobfs             重新生成 Hysteria2 混淆密码
 #   hys info                显示当前配置与分享链接
 #   hys start|stop|restart|status
 #   hys help
+#
+# 端口范围强制 40000-60000, 且两协议端口不得相同
 # =========================================================================
 
 INFO_ENV=/etc/hysteria/info.env
@@ -279,10 +352,8 @@ print_help() {
   cat <<'HEOF'
 用法: hys <子命令> [参数]
 
-  set <port>          同时修改 hy2 + anytls 端口 (回到同端口模式)
-  set hy2 <port>      只修改 Hysteria2 (UDP) 端口
-  set anytls <port>   只修改 AnyTLS (TCP) 端口
-  set both <port>     同 set <port>
+  set hy2 <port>      只修改 Hysteria2 (UDP) 端口 (40000-60000)
+  set anytls <port>   只修改 AnyTLS (TCP) 端口 (40000-60000)
   newpass             重新生成 Hysteria2 认证密码
   newobfs             重新生成 Hysteria2 混淆密码
   info                显示当前配置与分享链接
@@ -292,7 +363,7 @@ print_help() {
   status              查看服务运行状态
   help                显示本帮助
 
-端口建议: 40000-60000; 1-1024 为特权端口, 不推荐
+注: 端口范围强制 40000-60000, 且两协议端口不得相同 (同端口模式已移除)
 HEOF
 }
 
@@ -303,37 +374,25 @@ validate_port() {
       return 1
       ;;
   esac
-  if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then
-    echo -e "${RED}错误: 端口必须在 1-65535 之间${PLAIN}"
+  if [ "$1" -lt 40000 ] || [ "$1" -gt 60000 ]; then
+    echo -e "${RED}错误: 端口必须在 40000-60000 范围内${PLAIN}"
     return 1
   fi
-  if [ "$1" -lt 1024 ]; then
-    echo -e "${YELLOW}警告: 端口 <1024 为特权端口, 不推荐${PLAIN}"
-  fi
   return 0
 }
 
-# 检查端口占用: $1=udp|tcp $2=端口; 返回 0=空闲 1=被占
+# 端口占用检查: $1=udp|tcp $2=端口; 返回 0=空闲 1=被占
 check_port_free() {
-  if [ "$1" = "udp" ]; then
-    ss -Huln 2>/dev/null | awk '{print $5}' | grep -q ":$2\$" && return 1
-  else
-    ss -Htln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" && return 1
-  fi
+  case "$1" in
+    udp) ss -Huln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" && return 1 ;;
+    tcp) ss -Htln 2>/dev/null | awk '{print $4}' | grep -q ":$2\$" && return 1 ;;
+  esac
   return 0
-}
-
-show_mode() {
-  if [ "$HY_PORT" = "$ATLS_PORT" ]; then
-    echo -e "${CYAN}当前模式: 同端口 (hy2 与 anytls 共用 ${HY_PORT})${PLAIN}"
-  else
-    echo -e "${CYAN}当前模式: 分离端口 (hy2=${HY_PORT}/UDP, anytls=${ATLS_PORT}/TCP)${PLAIN}"
-  fi
 }
 
 print_links() {
   echo ""
-  echo -e "${GREEN}=== 当前配置 ===${PLAIN}"
+  echo -e "${GREEN}=== 当前配置 (分离端口) ===${PLAIN}"
   echo -e " 服务器地址    : ${CYAN}${SERVER_IP}${PLAIN}"
   echo -e " Hy2 端口     : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
   echo -e " AnyTLS 端口  : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
@@ -342,7 +401,6 @@ print_links() {
   echo -e " Hy2 obfs     : ${CYAN}gecko / ${HY_OBFS_PASS}${PLAIN}"
   echo -e " Hy2 pin      : ${CYAN}${HY_PIN}${PLAIN}"
   echo -e " AnyTLS 密码  : ${CYAN}${ATLS_PASS}${PLAIN}"
-  show_mode
   echo ""
   echo -e "${YELLOW}[Hysteria2 链接]${PLAIN}"
   echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?pinSHA256=${HY_PIN}&sni=${HY_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#Hy2-Gecko${PLAIN}"
@@ -358,6 +416,10 @@ do_set_hy2() {
     echo "Hysteria2 端口已是 ${NEW_PORT}，无需修改"
     return 0
   fi
+  if [ "$NEW_PORT" = "$ATLS_PORT" ]; then
+    echo -e "${RED}错误: 端口 ${NEW_PORT} 是 AnyTLS 当前端口, 两协议端口不得相同${PLAIN}"
+    return 1
+  fi
   if ! check_port_free udp "$NEW_PORT"; then
     echo -e "${RED}错误: UDP 端口 ${NEW_PORT} 已被其他进程占用${PLAIN}"
     return 1
@@ -367,7 +429,6 @@ do_set_hy2() {
   rc-service hysteria2 restart >/dev/null 2>&1
   . "$INFO_ENV"
   echo -e "${GREEN}✔ Hysteria2 端口已更新为 ${NEW_PORT} (UDP)${PLAIN}"
-  show_mode
   print_links
 }
 
@@ -381,6 +442,10 @@ do_set_anytls() {
     echo "AnyTLS 端口已是 ${NEW_PORT}，无需修改"
     return 0
   fi
+  if [ "$NEW_PORT" = "$HY_PORT" ]; then
+    echo -e "${RED}错误: 端口 ${NEW_PORT} 是 Hysteria2 当前端口, 两协议端口不得相同${PLAIN}"
+    return 1
+  fi
   if ! check_port_free tcp "$NEW_PORT"; then
     echo -e "${RED}错误: TCP 端口 ${NEW_PORT} 已被其他进程占用${PLAIN}"
     return 1
@@ -389,64 +454,24 @@ do_set_anytls() {
   rc-service anytls restart >/dev/null 2>&1
   . "$INFO_ENV"
   echo -e "${GREEN}✔ AnyTLS 端口已更新为 ${NEW_PORT} (TCP)${PLAIN}"
-  show_mode
-  print_links
-}
-
-do_set_both() {
-  NEW_PORT=$1
-  if [ "$NEW_PORT" != "$HY_PORT" ] && ! check_port_free udp "$NEW_PORT"; then
-    echo -e "${RED}错误: UDP 端口 ${NEW_PORT} 已被其他进程占用${PLAIN}"
-    return 1
-  fi
-  if [ -f /etc/init.d/anytls ] && [ "$NEW_PORT" != "$ATLS_PORT" ] && ! check_port_free tcp "$NEW_PORT"; then
-    echo -e "${RED}错误: TCP 端口 ${NEW_PORT} 已被其他进程占用${PLAIN}"
-    return 1
-  fi
-
-  CHANGED_HY=0
-  CHANGED_ATLS=0
-  if [ "$NEW_PORT" != "$HY_PORT" ]; then
-    sed -i "s|^listen:.*|listen: :${NEW_PORT}|" "$HY_CONFIG"
-    sed -i "s|^HY_PORT=.*|HY_PORT=${NEW_PORT}|" "$INFO_ENV"
-    CHANGED_HY=1
-  fi
-  if [ -f /etc/init.d/anytls ] && [ "$NEW_PORT" != "$ATLS_PORT" ]; then
-    sed -i "s|^ATLS_PORT=.*|ATLS_PORT=${NEW_PORT}|" "$INFO_ENV"
-    CHANGED_ATLS=1
-  fi
-
-  [ "$CHANGED_HY" = "1" ] && rc-service hysteria2 restart >/dev/null 2>&1
-  [ "$CHANGED_ATLS" = "1" ] && rc-service anytls restart >/dev/null 2>&1
-
-  . "$INFO_ENV"
-  if [ "$CHANGED_HY" = "0" ] && [ "$CHANGED_ATLS" = "0" ]; then
-    echo "两个协议端口均已是 ${NEW_PORT}，无需修改"
-  else
-    echo -e "${GREEN}✔ 端口已更新为 ${NEW_PORT} (hy2/UDP + anytls/TCP)${PLAIN}"
-  fi
-  show_mode
   print_links
 }
 
 cmd_set() {
-  if [ $# -eq 1 ]; then
-    validate_port "$1" && do_set_both "$1"
-  elif [ $# -eq 2 ]; then
-    case "$1" in
-      hy2)    validate_port "$2" && do_set_hy2 "$2" ;;
-      anytls) validate_port "$2" && do_set_anytls "$2" ;;
-      both)   validate_port "$2" && do_set_both "$2" ;;
-      *)
-        echo -e "${RED}错误: 未知目标 '$1'，可用值: hy2 / anytls / both${PLAIN}"
-        echo "用法: hys set [hy2|anytls|both] <port>"
-        return 1
-        ;;
-    esac
-  else
-    echo "用法: hys set [hy2|anytls|both] <port>"
+  if [ $# -ne 2 ]; then
+    echo -e "${RED}错误: 参数不足${PLAIN}"
+    echo "用法: hys set <hy2|anytls> <port>"
     return 1
   fi
+  case "$1" in
+    hy2)    validate_port "$2" && do_set_hy2 "$2" ;;
+    anytls) validate_port "$2" && do_set_anytls "$2" ;;
+    *)
+      echo -e "${RED}错误: 未知目标 '$1'，可用值: hy2 / anytls${PLAIN}"
+      echo "用法: hys set <hy2|anytls> <port>"
+      return 1
+      ;;
+  esac
 }
 
 cmd_newpass() {
@@ -529,13 +554,13 @@ rc-service hysteria2 status || true
 [ "$INSTALL_ATLS" = "1" ] && rc-service anytls status || true
 
 echo -e "\n${GREEN}================================================================${PLAIN}"
-echo -e "${GREEN}🎉 双协议部署成功！(初始同端口模式)${PLAIN}"
+echo -e "${GREEN}🎉 双协议部署成功！(分离端口模式)${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
-echo -e " 📍 服务器地址      : ${CYAN}${SERVER_IP}${PLAIN}"
-echo -e " 🔢 Hysteria2 端口  : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
-echo -e " 🔢 AnyTLS 端口     : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
-echo -e " 🌐 伪装 SNI        : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
-echo -e " 🔐 Hy2 指纹        : ${CYAN}${PIN_SHA256}${PLAIN}"
+echo -e " 📍 服务器地址        : ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e " 🔢 Hysteria2 端口    : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
+echo -e " 🔢 AnyTLS 端口       : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
+echo -e " 🌐 伪装 SNI          : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
+echo -e " 🔐 Hy2 指纹          : ${CYAN}${PIN_SHA256}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 echo -e " [1] Hysteria 2 (Gecko)"
 echo -e "   - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
@@ -554,9 +579,8 @@ if [ "$INSTALL_ATLS" = "1" ]; then
 fi
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e "${YELLOW}[后续管理命令]${PLAIN}"
-echo -e "  hys set 50000          # hy2 + anytls 同时改为 50000"
-echo -e "  hys set hy2 50000      # 只改 Hysteria2 (UDP) 端口"
-echo -e "  hys set anytls 50001   # 只改 AnyTLS (TCP) 端口"
+echo -e "  hys set hy2 51234      # 只改 Hysteria2 (UDP) 端口"
+echo -e "  hys set anytls 51567   # 只改 AnyTLS (TCP) 端口"
 echo -e "  hys info               # 查看当前配置与分享链接"
 echo -e "  hys newpass            # 重生成 Hysteria2 认证密码"
 echo -e "  hys newobfs            # 重生成 Hysteria2 混淆密码"
