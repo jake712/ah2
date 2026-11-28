@@ -17,10 +17,11 @@
 #     hys setip <IP|域名>     修正分享链接中的服务器地址
 #     hys newpass / newobfs / info / start / stop / restart / status
 #
-# [E] 节点备注名自动生成:
-#     - 格式: 国家代号-IP尾2位数字, 例如: US-45 / JP-01
+# [E] 节点链接名自动生成:
+#     - 格式: 协议名-国家代号-IP尾2位数字
+#       例如: hy2-US-45 / atls-US-45 / hy2-JP-01
 #     - 国家代号通过 ip-api.com 自动查询, 失败时回退为 NA
-#     - hys setip 修改地址后会自动重新计算备注名
+#     - hys setip 修改地址后会自动重新计算
 #
 # 注意:
 # - Hysteria2 (UDP) 要求服务商转发规则包含 UDP
@@ -267,7 +268,8 @@ if [ -z "$SERVER_IP" ]; then
   SERVER_IP="${DETECTED_IP:-YOUR_SERVER_IP}"
 fi
 
-# --- 节点备注名: 国家代号-IP尾2位数字 (例如 US-45 / JP-01) ---
+# --- 节点基础备注名: 国家代号-IP尾2位数字 (例如 US-45 / JP-01) ---
+# 链接名会按协议自动加前缀: hy2-<REMARK> / atls-<REMARK>
 gen_remark() {
   HOST_GR="$1"
   # 去除 IPv6 方括号
@@ -289,7 +291,7 @@ gen_remark() {
   echo "${CC_GR}-${TAIL_GR}"
 }
 REMARK=$(gen_remark "$SERVER_IP")
-echo -e "${CYAN}✔ 节点备注名: ${REMARK} (国家代号-IP尾2位)${PLAIN}"
+echo -e "${CYAN}✔ 节点链接名: hy2-${REMARK} / atls-${REMARK} (协议-国家-IP尾2位)${PLAIN}"
 
 # --- IP 确认提示 (NAT VPS 必读) ---
 echo ""
@@ -358,7 +360,7 @@ EOF
 chmod +x /etc/init.d/anytls
 fi
 
-# 安装 hys 管理命令 (含 setip, 自动更新备注名)
+# 安装 hys 管理命令 (含 setip, 自动更新链接名)
 cat > /usr/local/bin/hys <<'HYSEOF'
 #!/bin/sh
 # =========================================================================
@@ -396,7 +398,8 @@ format_host() {
   esac
 }
 
-# 节点备注名: 国家代号-IP尾2位数字 (例如 US-45 / JP-01)
+# 节点基础备注名: 国家代号-IP尾2位数字 (例如 US-45 / JP-01)
+# 链接名 = 协议名-<REMARK>, 例如: hy2-US-45 / atls-US-45
 gen_remark() {
   HOST_GR="$1"
   case "$HOST_GR" in \[*\]) HOST_GR="${HOST_GR#\[}"; HOST_GR="${HOST_GR%\]}" ;; esac
@@ -421,7 +424,7 @@ cat <<'HEOF'
   set hy2 <port>       只修改 Hysteria2 (UDP) 端口
   set anytls <port>    只修改 AnyTLS (TCP) 端口
   setip <IP|域名>      修正分享链接中的服务器地址 (NAT VPS 填服务商面板上的入站 IP;
-                       支持 IPv6/域名, 修改后自动重算节点备注名)
+                       支持 IPv6/域名, 修改后自动重算节点链接名)
   newpass              重新生成 Hysteria2 认证密码
   newobfs              重新生成 Hysteria2 混淆密码
   info                 显示当前配置与分享链接
@@ -445,6 +448,8 @@ validate_port() {
 
 print_links() {
   HOST_F=$(format_host "$SERVER_IP")
+  HY_NAME="hy2-${REMARK}"
+  ATLS_NAME="atls-${REMARK}"
   echo ""
   echo -e "${GREEN}=== 当前配置 ===${PLAIN}"
   echo -e "  服务器地址    : ${CYAN}${SERVER_IP}${PLAIN}"
@@ -455,13 +460,13 @@ print_links() {
   echo -e "  Hy2 obfs      : ${CYAN}gecko / ${HY_OBFS_PASS}${PLAIN}"
   echo -e "  Hy2 pin       : ${CYAN}${HY_PIN}${PLAIN}"
   echo -e "  AnyTLS 密码   : ${CYAN}${ATLS_PASS}${PLAIN}"
-  echo -e "  节点备注名    : ${CYAN}${REMARK}${PLAIN}"
+  echo -e "  节点链接名    : ${CYAN}${HY_NAME} / ${ATLS_NAME}${PLAIN}"
   echo ""
   echo -e "${YELLOW}[Hysteria2 链接]${PLAIN}"
-  echo -e "${CYAN}hy2://${HY_PASS}@${HOST_F}:${HY_PORT}?pinSHA256=${HY_PIN}&sni=${HY_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#${REMARK}${PLAIN}"
+  echo -e "${CYAN}hy2://${HY_PASS}@${HOST_F}:${HY_PORT}?pinSHA256=${HY_PIN}&sni=${HY_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#${HY_NAME}${PLAIN}"
   echo ""
   echo -e "${YELLOW}[AnyTLS 链接]${PLAIN}"
-  echo -e "${CYAN}anytls://${ATLS_PASS}@${HOST_F}:${ATLS_PORT}?sni=${HY_SNI}&insecure=1#${REMARK}${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${HOST_F}:${ATLS_PORT}?sni=${HY_SNI}&insecure=1#${ATLS_NAME}${PLAIN}"
   echo ""
   echo -e "${YELLOW}提示: 若地址与面板入站 IP 不符, 执行 hys setip <面板IP> 修正${PLAIN}"
   echo ""
@@ -539,12 +544,12 @@ cmd_setip() {
     echo "服务器地址已是 ${NEW_IP}，无需修改"
     return 0
   fi
-  # 更新地址并重算节点备注名 (国家代号-IP尾2位)
+  # 更新地址并重算节点链接名 (协议-国家-IP尾2位)
   NEW_REMARK=$(gen_remark "$NEW_IP")
   sed -i "s|^SERVER_IP=.*|SERVER_IP=${NEW_IP}|" "$INFO_ENV"
   sed -i "s|^REMARK=.*|REMARK=${NEW_REMARK}|" "$INFO_ENV"
   . "$INFO_ENV"
-  echo -e "${GREEN}✔ 服务器地址已更新为 ${NEW_IP} (节点备注名: ${REMARK})${PLAIN}"
+  echo -e "${GREEN}✔ 服务器地址已更新为 ${NEW_IP} (链接名: hy2-${REMARK} / atls-${REMARK})${PLAIN}"
   print_links
 }
 
@@ -625,11 +630,13 @@ rc-service hysteria2 status || true
 [ "$INSTALL_ATLS" = "1" ] && rc-service anytls status || true
 
 HOST_F=$(format_host "$SERVER_IP")
+HY_NAME="hy2-${REMARK}"
+ATLS_NAME="atls-${REMARK}"
 echo -e "\n${GREEN}================================================================${PLAIN}"
 echo -e "${GREEN}🎉 双协议部署成功！(NAT VPS / 分离端口)${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e "  📍 服务器地址     : ${CYAN}${SERVER_IP}${PLAIN}"
-echo -e "  🏷  节点备注名     : ${CYAN}${REMARK}${PLAIN} (国家代号-IP尾2位)"
+echo -e "  🏷  节点链接名     : ${CYAN}${HY_NAME} / ${ATLS_NAME}${PLAIN}"
 echo -e "  🔢 Hysteria2 端口 : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
 echo -e "  🔢 AnyTLS 端口    : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
 echo -e "  🌐 伪装 SNI       : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
@@ -645,10 +652,10 @@ if [ "$INSTALL_ATLS" = "1" ]; then
   echo -e "----------------------------------------------------------------"
 fi
 echo -e "${YELLOW}[Hysteria 2 直连链接]${PLAIN}"
-echo -e "${CYAN}hy2://${HY_PASS}@${HOST_F}:${HY_PORT}?pinSHA256=${PIN_SHA256}&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#${REMARK}${PLAIN}"
+echo -e "${CYAN}hy2://${HY_PASS}@${HOST_F}:${HY_PORT}?pinSHA256=${PIN_SHA256}&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#${HY_NAME}${PLAIN}"
 if [ "$INSTALL_ATLS" = "1" ]; then
   echo -e "\n${YELLOW}[AnyTLS 直连链接]${PLAIN}"
-  echo -e "${CYAN}anytls://${ATLS_PASS}@${HOST_F}:${ATLS_PORT}?sni=${OPTIMIZED_SNI}&insecure=1#${REMARK}${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${HOST_F}:${ATLS_PORT}?sni=${OPTIMIZED_SNI}&insecure=1#${ATLS_NAME}${PLAIN}"
 fi
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e "${YELLOW}[NAT VPS 检查清单]${PLAIN}"
@@ -659,7 +666,7 @@ echo -e "  4. hy2 连不上时优先确认服务商是否转发 UDP"
 echo -e "${YELLOW}[后续管理命令]${PLAIN}"
 echo -e "  hys set hy2 <端口>      # 只改 Hysteria2 (UDP) 端口"
 echo -e "  hys set anytls <端口>   # 只改 AnyTLS (TCP) 端口"
-echo -e "  hys setip <IP>          # 修正分享链接中的服务器地址 (自动重算备注名)"
+echo -e "  hys setip <IP>          # 修正分享链接中的服务器地址 (自动重算链接名)"
 echo -e "  hys info                # 查看当前配置与分享链接"
 echo -e "  hys restart / status    # 重启 / 状态"
 echo -e "${GREEN}================================================================${PLAIN}"
