@@ -11,29 +11,16 @@ SSH的IP
 *** karing  打開設定 > TLS > 跳動證書驗證 打開
 
 Alpine 一鍵安裝Hysteria 2 + AnyTls單端口穩定版(65M Ram可用)
-```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/al-obfs-v6.sh | bash -s -- -p 端口 -i 主機IP
-```
 
-Debian 一鍵安裝Hysteria 2 + AnyTls單端口穩定版(65M Ram可用)
- 
 ```
-curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/db-obfs-v6.sh  | bash -s -- -p 端口 -i 主機IP
-```
-
-youtube: https://www.youtube.com/watch?v=xwu93mbMqmA
-
-donate: https://jake712.com/?p=120
-
-
-如果不通可能沒安裝IP TABLE
-```
-apt-get update && apt-get install -y iptables && systemctl restart hysteria
+curl -fsSL https://raw.githubusercontent.com/jake712/ah2/main/al-obfs-v7.sh | bash -s -- -p 端口 -i 主機IP
 ```
 
 
 
-如出現這錯誤
+
+
+出現這錯誤
 
 Could not resolve host: raw.githubusercontent.com (Could not contact DNS servers)
 ```
