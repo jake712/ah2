@@ -1,31 +1,22 @@
 #!/bin/sh
 # =========================================================================
-# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本 (NAT VPS 专用 + IP 校正版)
+# Hysteria 2 (Gecko) + AnyTLS Alpine 部署脚本 (NAT VPS 专用版)
 # 适用: Alpine Linux 3.20+ (NAT VPS / LXC 容器均可, OpenRC 可用即可)
 #
 # NAT VPS 适配:
-# [A] 无端口扫描: 不检查占用, 端口分配仅保证 hy2 与 anytls 不同
-# [B] -p / -t 可选, 不指定则自动随机分配 (默认池见下方配置区)
-# [C] IP 处理 (防出站/入站 IP 混淆):
-#     - 优先级: -i 参数 > FORCE_SERVER_IP 环境变量 > 自动检测
-#     - 自动检测的是【出站 IP】, NAT VPS 客户端连接的是【面板入站 IP】,
-#       两者可能不同! 部署时会显式提示, 不一致时用 hys setip 修正
-#     - 支持 IPv6 (链接自动加 []) 与域名 (可配合 DDNS)
-# [D] hys 管理命令:
-#     hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
-#     hys set anytls <port>   只修改 AnyTLS (TCP) 端口
-#     hys setip <IP|域名>     修正分享链接中的服务器地址
-#     hys newpass / newobfs / info / start / stop / restart / status
-#
-# [E] 节点链接名自动生成:
-#     - 格式: 协议名-国家代号-IP尾2位数字
-#       例如: hy2-US-45 / atls-US-45 / hy2-JP-01
-#     - 国家代号通过 ip-api.com 自动查询, 失败时回退为 NA
-#     - hys setip 修改地址后会自动重新计算
+# [A] 已移除全部端口扫描逻辑 (无 ss 占用检查 / 无兜底扫描),
+#     连带不再安装 iproute2 / gawk, 依赖更精简
+# [B] 端口分配规则: hy2 与 anytls 端口保证不同, 仅此一条
+# [C] -p / -t 可选: 不指定则自动随机分配 (默认池见下方配置区);
+#     NAT VPS 请确保端口落在服务商转发范围内, 不在范围内时
+#     用 -p/-t 指定, 或部署后用 hys set 修改
+# [D] 公网 IP 自动检测返回的是共享 IP (即客户端实际连接的 IP)
+# [E] 节点命名: 国家代号 + IP 尾 2 位, 如 SG-47
 #
 # 注意:
-# - Hysteria2 (UDP) 要求服务商转发规则包含 UDP
-# - 若所选端口在容器内部被占用, 服务会启动失败,
+# - Hysteria2 (UDP) 要求服务商转发规则包含 UDP; 部分 NAT VPS 仅转发 TCP,
+#   若 hy2 连不上请先确认 UDP 转发
+# - 无占用扫描: 若所选端口恰好在容器内部被占用, 服务会启动失败,
 #   用 hys status / 日志排查后 hys set 换端口即可
 # =========================================================================
 set -e
@@ -42,11 +33,9 @@ while getopts "p:t:i:h" opt; do
     t) CUSTOM_ATLS_PORT=$OPTARG ;;
     i) CUSTOM_IP=$OPTARG ;;
     h) echo "用法: $0 [选项]"
-       echo "  -p <端口>    自定义 Hysteria2 (UDP) 端口 (可选, 不指定则自动分配)"
-       echo "  -t <端口>    自定义 AnyTLS (TCP) 端口 (可选, 不指定则自动分配)"
-       echo "  -i <IP|域名> 手动指定服务器地址 (推荐! 填服务商面板的入站 IP)"
-       echo "  也可用环境变量: FORCE_SERVER_IP=<IP> $0"
-       echo "  -h           显示本帮助"
+       echo "  -p <端口>   自定义 Hysteria2 (UDP) 端口 (可选, 不指定则自动分配)"
+       echo "  -t <端口>   自定义 AnyTLS (TCP) 端口 (可选, 不指定则自动分配)"
+       echo "  -i <公网IP> 手动指定服务器公网 IP (NAT VPS 通常自动检测即共享 IP, 可不填)"
        echo "注: NAT VPS 请确保端口在服务商转发范围内, 两端口必须不同"
        exit 0 ;;
   esac
@@ -111,14 +100,6 @@ validate_port() {
     ''|*[!0-9]*) echo -e "${RED}错误: 端口必须是纯数字${PLAIN}"; return 1 ;;
   esac
   return 0
-}
-
-# IPv6 地址在分享链接中需要 [] 括号, 域名/IPv4 原样输出
-format_host() {
-  case "$1" in
-    *:*) echo "[$1]" ;;
-    *) echo "$1" ;;
-  esac
 }
 
 # --- Hysteria2 (UDP) 端口 ---
@@ -248,65 +229,21 @@ EOF
 
 # ===== [6/7] 写入 info.env + OpenRC 服务单元 + hys 管理命令 =====
 echo -e "${YELLOW}[6/7] 写入配置数据库与服务单元...${PLAIN}"
-
-# --- SERVER_IP: 优先级 -i 参数 > FORCE_SERVER_IP 环境变量 > 自动检测 ---
 SERVER_IP="$CUSTOM_IP"
-IP_SOURCE="manual"
-if [ -z "$SERVER_IP" ] && [ -n "$FORCE_SERVER_IP" ]; then
-  SERVER_IP="$FORCE_SERVER_IP"
-  IP_SOURCE="env"
-fi
 if [ -z "$SERVER_IP" ]; then
-  IP_SOURCE="auto"
-  DETECTED_IP=$(curl -4s --max-time 4 api.ipify.org 2>/dev/null || true)
-  if [ -z "$DETECTED_IP" ]; then
-    DETECTED_IP=$(curl -4s --max-time 4 ifconfig.me 2>/dev/null || true)
-  fi
-  if [ -z "$DETECTED_IP" ]; then
-    DETECTED_IP=$(curl -6s --max-time 4 api64.ipify.org 2>/dev/null || true)
-  fi
-  SERVER_IP="${DETECTED_IP:-YOUR_SERVER_IP}"
+  SERVER_IP=$(curl -4s --max-time 4 api.ipify.org || curl -4s --max-time 4 ifconfig.me || echo "YOUR_SERVER_IP")
 fi
 
-# --- 节点基础备注名: 国家代号-IP尾2位数字 (例如 US-45 / JP-01) ---
-# 链接名会按协议自动加前缀: hy2-<REMARK> / atls-<REMARK>
-gen_remark() {
-  HOST_GR="$1"
-  # 去除 IPv6 方括号
-  case "$HOST_GR" in \[*\]) HOST_GR="${HOST_GR#\[}"; HOST_GR="${HOST_GR%\]}" ;; esac
-  # 提取所有数字, 取最后 2 位 (不足 2 位则前面补 0)
-  DIGITS_GR=$(printf '%s' "$HOST_GR" | tr -dc '0-9')
-  TAIL_GR=$(printf '%s' "$DIGITS_GR" | tail -c 3 | tr -d '\n')
-  case "$TAIL_GR" in
-    [0-9][0-9]) TAIL_GR="$TAIL_GR" ;;
-    [0-9]) TAIL_GR="0$TAIL_GR" ;;
-    *) TAIL_GR="00" ;;
-  esac
-  # 查询国家代号 (ip-api.com, 失败回退 NA)
-  CC_GR=$(curl -s --max-time 5 "http://ip-api.com/line/${HOST_GR}?fields=countryCode" 2>/dev/null | tr -d '\n\r ' )
-  case "$CC_GR" in
-    [A-Za-z][A-Za-z]) CC_GR=$(printf '%s' "$CC_GR" | tr 'a-z' 'A-Z') ;;
-    *) CC_GR="NA" ;;
-  esac
-  echo "${CC_GR}-${TAIL_GR}"
-}
-REMARK=$(gen_remark "$SERVER_IP")
-echo -e "${CYAN}✔ 节点链接名: hy2-${REMARK} / atls-${REMARK} (协议-国家-IP尾2位)${PLAIN}"
-
-# --- IP 确认提示 (NAT VPS 必读) ---
-echo ""
-echo -e "${YELLOW}═══════════ IP 确认提示 (NAT VPS 必读) ═══════════${PLAIN}"
-echo -e " 当前使用的地址 : ${CYAN}${SERVER_IP}${PLAIN}"
-case "$IP_SOURCE" in
-  manual) echo -e " 来源           : 手动指定 (-i 参数, 已跳过自动检测)" ;;
-  env)    echo -e " 来源           : 环境变量 FORCE_SERVER_IP (已跳过自动检测)" ;;
-  *)      echo -e " 来源           : ${RED}自动检测${PLAIN} — 这是${RED}出站 IP${PLAIN} (服务器访问外网用的 IP)"
-          echo -e "                  ${YELLOW}⚠ NAT VPS 客户端连接的是【服务商面板上的入站 IP】, 两者可能不同!${PLAIN}"
-          echo -e "                  若面板 IP 与上面不同, 部署后一条命令修正:"
-          echo -e "                  ${CYAN}hys setip <面板入站IP>${PLAIN}" ;;
+# ---- 节点名称: 国家代号 + IP 尾 2 位 (如 SG-47) ----
+NODE_CC=$(curl -4s --max-time 5 https://ipinfo.io/country | tr -d '[:space:]')
+case "$NODE_CC" in
+  ''|*[!a-zA-Z]*) NODE_CC="XX" ;;   # 查询失败时使用 XX 兜底
 esac
-echo -e "${YELLOW}══════════════════════════════════════════════════${PLAIN}"
-echo ""
+# 取 SERVER_IP 最后 2 个字符 (IPv4 尾段数字; 若为域名/IPv6 也能取尾 2 位)
+NODE_TAIL=$(printf '%s' "$SERVER_IP" | awk '{print substr($0, length($0)-1)}')
+NODE_TAG="${NODE_CC}-${NODE_TAIL}"
+echo -e "${CYAN}✔ 节点名称: ${NODE_TAG}${PLAIN}"
+# --------------------------------------------------
 
 cat > /etc/hysteria/info.env <<EOF
 HY_PORT=${HY_PORT}
@@ -317,7 +254,7 @@ ATLS_PASS=${ATLS_PASS}
 HY_SNI=${OPTIMIZED_SNI}
 HY_PIN=${PIN_SHA256}
 SERVER_IP=${SERVER_IP}
-REMARK=${REMARK}
+NODE_TAG=${NODE_TAG}
 EOF
 chmod 600 /etc/hysteria/info.env
 
@@ -341,7 +278,7 @@ chmod +x /etc/init.d/hysteria2
 
 # AnyTLS OpenRC 服务单元 (动态 source info.env)
 if [ "$INSTALL_ATLS" = "1" ]; then
-cat > /etc/init.d/anytls <<EOF
+cat > /etc/init.d/anytls <<'EOF'
 #!/sbin/openrc-run
 . /etc/hysteria/info.env
 name="anytls"
@@ -360,21 +297,18 @@ EOF
 chmod +x /etc/init.d/anytls
 fi
 
-# 安装 hys 管理命令 (含 setip, 自动更新链接名)
+# 安装 hys 管理命令 (无占用扫描版)
 cat > /usr/local/bin/hys <<'HYSEOF'
 #!/bin/sh
 # =========================================================================
-# hys - Hysteria2 + AnyTLS 一站式管理命令 (NAT VPS 版)
-#   hys set hy2 <port>      只修改 Hysteria2 (UDP) 端口
-#   hys set anytls <port>   只修改 AnyTLS (TCP) 端口
-#   hys setip <IP|域名>     修正分享链接中的服务器地址 (NAT 入站 IP)
-#   hys newpass             重新生成 Hysteria2 认证密码
-#   hys newobfs             重新生成 Hysteria2 混淆密码
-#   hys info                显示当前配置与分享链接
+# hys - Hysteria2 + AnyTLS 一站式管理命令 (NAT VPS 版, 无端口扫描)
+#   hys set hy2 <port>        只修改 Hysteria2 (UDP) 端口
+#   hys set anytls <port>     只修改 AnyTLS (TCP) 端口
+#   hys newpass               重新生成 Hysteria2 认证密码
+#   hys newobfs               重新生成 Hysteria2 混淆密码
+#   hys info                  显示当前配置与分享链接
 #   hys start|stop|restart|status
 #   hys help
-#
-# 端口不限制范围, 仅要求纯数字; 两协议端口不得相同
 # =========================================================================
 INFO_ENV=/etc/hysteria/info.env
 HY_CONFIG=/etc/hysteria/config.yaml
@@ -390,52 +324,22 @@ if [ ! -f "$INFO_ENV" ]; then
 fi
 . "$INFO_ENV"
 
-# IPv6 地址在分享链接中需要 [] 括号
-format_host() {
-  case "$1" in
-    *:*) echo "[$1]" ;;
-    *) echo "$1" ;;
-  esac
-}
-
-# 节点基础备注名: 国家代号-IP尾2位数字 (例如 US-45 / JP-01)
-# 链接名 = 协议名-<REMARK>, 例如: hy2-US-45 / atls-US-45
-gen_remark() {
-  HOST_GR="$1"
-  case "$HOST_GR" in \[*\]) HOST_GR="${HOST_GR#\[}"; HOST_GR="${HOST_GR%\]}" ;; esac
-  DIGITS_GR=$(printf '%s' "$HOST_GR" | tr -dc '0-9')
-  TAIL_GR=$(printf '%s' "$DIGITS_GR" | tail -c 3 | tr -d '\n')
-  case "$TAIL_GR" in
-    [0-9][0-9]) TAIL_GR="$TAIL_GR" ;;
-    [0-9]) TAIL_GR="0$TAIL_GR" ;;
-    *) TAIL_GR="00" ;;
-  esac
-  CC_GR=$(curl -s --max-time 5 "http://ip-api.com/line/${HOST_GR}?fields=countryCode" 2>/dev/null | tr -d '\n\r ' )
-  case "$CC_GR" in
-    [A-Za-z][A-Za-z]) CC_GR=$(printf '%s' "$CC_GR" | tr 'a-z' 'A-Z') ;;
-    *) CC_GR="NA" ;;
-  esac
-  echo "${CC_GR}-${TAIL_GR}"
-}
-
 print_help() {
 cat <<'HEOF'
 用法: hys <子命令> [参数]
-  set hy2 <port>       只修改 Hysteria2 (UDP) 端口
-  set anytls <port>    只修改 AnyTLS (TCP) 端口
-  setip <IP|域名>      修正分享链接中的服务器地址 (NAT VPS 填服务商面板上的入站 IP;
-                       支持 IPv6/域名, 修改后自动重算节点链接名)
-  newpass              重新生成 Hysteria2 认证密码
-  newobfs              重新生成 Hysteria2 混淆密码
-  info                 显示当前配置与分享链接
-  start                启动 hysteria2 与 anytls 服务
-  stop                 停止服务
-  restart              重启服务
-  status               查看服务运行状态
-  help                 显示本帮助
+  set hy2 <port>        只修改 Hysteria2 (UDP) 端口
+  set anytls <port>     只修改 AnyTLS (TCP) 端口
+  newpass               重新生成 Hysteria2 认证密码
+  newobfs               重新生成 Hysteria2 混淆密码
+  info                  显示当前配置与分享链接
+  start                 启动 hysteria2 与 anytls 服务
+  stop                  停止服务
+  restart               重启服务
+  status                查看服务运行状态
+  help                  显示本帮助
 
-注: 端口仅要求纯数字, 两协议端口不得相同; NAT VPS 请使用服务商转发范围内的端口
-    (hy2 需 UDP 转发); 分享链接中的 IP 应为面板入站 IP, 不符时用 setip 修正
+注: 端口仅要求纯数字, 两协议端口不得相同;
+    NAT VPS 请使用服务商转发范围内的端口 (hy2 需 UDP 转发)
 HEOF
 }
 
@@ -447,28 +351,23 @@ validate_port() {
 }
 
 print_links() {
-  HOST_F=$(format_host "$SERVER_IP")
-  HY_NAME="hy2-${REMARK}"
-  ATLS_NAME="atls-${REMARK}"
   echo ""
   echo -e "${GREEN}=== 当前配置 ===${PLAIN}"
-  echo -e "  服务器地址    : ${CYAN}${SERVER_IP}${PLAIN}"
-  echo -e "  Hy2 端口      : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
-  echo -e "  AnyTLS 端口   : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
-  echo -e "  伪装 SNI      : ${CYAN}${HY_SNI}${PLAIN}"
-  echo -e "  Hy2 认证      : ${CYAN}${HY_PASS}${PLAIN}"
-  echo -e "  Hy2 obfs      : ${CYAN}gecko / ${HY_OBFS_PASS}${PLAIN}"
-  echo -e "  Hy2 pin       : ${CYAN}${HY_PIN}${PLAIN}"
-  echo -e "  AnyTLS 密码   : ${CYAN}${ATLS_PASS}${PLAIN}"
-  echo -e "  节点链接名    : ${CYAN}${HY_NAME} / ${ATLS_NAME}${PLAIN}"
+  echo -e "  节点名称     : ${CYAN}${NODE_TAG}${PLAIN}"
+  echo -e "  服务器地址   : ${CYAN}${SERVER_IP}${PLAIN}"
+  echo -e "  Hy2 端口     : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
+  echo -e "  AnyTLS 端口  : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
+  echo -e "  伪装 SNI     : ${CYAN}${HY_SNI}${PLAIN}"
+  echo -e "  Hy2 认证     : ${CYAN}${HY_PASS}${PLAIN}"
+  echo -e "  Hy2 obfs     : ${CYAN}gecko / ${HY_OBFS_PASS}${PLAIN}"
+  echo -e "  Hy2 pin      : ${CYAN}${HY_PIN}${PLAIN}"
+  echo -e "  AnyTLS 密码  : ${CYAN}${ATLS_PASS}${PLAIN}"
   echo ""
   echo -e "${YELLOW}[Hysteria2 链接]${PLAIN}"
-  echo -e "${CYAN}hy2://${HY_PASS}@${HOST_F}:${HY_PORT}?pinSHA256=${HY_PIN}&sni=${HY_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#${HY_NAME}${PLAIN}"
+  echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?pinSHA256=${HY_PIN}&sni=${HY_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#Hy2-${NODE_TAG}${PLAIN}"
   echo ""
   echo -e "${YELLOW}[AnyTLS 链接]${PLAIN}"
-  echo -e "${CYAN}anytls://${ATLS_PASS}@${HOST_F}:${ATLS_PORT}?sni=${HY_SNI}&insecure=1#${ATLS_NAME}${PLAIN}"
-  echo ""
-  echo -e "${YELLOW}提示: 若地址与面板入站 IP 不符, 执行 hys setip <面板IP> 修正${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${SERVER_IP}:${ATLS_PORT}?sni=${HY_SNI}&insecure=1#AnyTLS-${NODE_TAG}${PLAIN}"
   echo ""
 }
 
@@ -526,33 +425,6 @@ cmd_set() {
   esac
 }
 
-cmd_setip() {
-  NEW_IP=$1
-  if [ -z "$NEW_IP" ]; then
-    echo "用法: hys setip <IP 或域名>"
-    return 1
-  fi
-  # 允许用户带 [] 输入 IPv6, 自动去除括号 (链接生成时统一加回)
-  case "$NEW_IP" in
-    \[*\]) NEW_IP="${NEW_IP#\[}"; NEW_IP="${NEW_IP%\]}" ;;
-  esac
-  # 仅允许数字/字母/点/冒号/下划线/连字符 (覆盖 IPv4/IPv6/域名)
-  case "$NEW_IP" in
-    *[!0-9a-zA-Z.:_-]*) echo -e "${RED}错误: 地址包含非法字符${PLAIN}"; return 1 ;;
-  esac
-  if [ "$NEW_IP" = "$SERVER_IP" ]; then
-    echo "服务器地址已是 ${NEW_IP}，无需修改"
-    return 0
-  fi
-  # 更新地址并重算节点链接名 (协议-国家-IP尾2位)
-  NEW_REMARK=$(gen_remark "$NEW_IP")
-  sed -i "s|^SERVER_IP=.*|SERVER_IP=${NEW_IP}|" "$INFO_ENV"
-  sed -i "s|^REMARK=.*|REMARK=${NEW_REMARK}|" "$INFO_ENV"
-  . "$INFO_ENV"
-  echo -e "${GREEN}✔ 服务器地址已更新为 ${NEW_IP} (链接名: hy2-${REMARK} / atls-${REMARK})${PLAIN}"
-  print_links
-}
-
 cmd_newpass() {
   NEW_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
   sed -i "s|^HY_PASS=.*|HY_PASS=${NEW_PASS}|" "$INFO_ENV"
@@ -595,15 +467,14 @@ cmd_status() {
 }
 
 case "$1" in
-  set)     shift; cmd_set "$@" ;;
-  setip)   cmd_setip "$2" ;;
+  set) shift; cmd_set "$@" ;;
   newpass) cmd_newpass ;;
   newobfs) cmd_newobfs ;;
-  info)    print_links ;;
-  start)   cmd_start ;;
-  stop)    cmd_stop ;;
+  info) print_links ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
   restart) cmd_restart ;;
-  status)  cmd_status ;;
+  status) cmd_status ;;
   help|-h|--help|"") print_help ;;
   *) echo "未知子命令: $1"; print_help; exit 1 ;;
 esac
@@ -629,44 +500,39 @@ sleep 2
 rc-service hysteria2 status || true
 [ "$INSTALL_ATLS" = "1" ] && rc-service anytls status || true
 
-HOST_F=$(format_host "$SERVER_IP")
-HY_NAME="hy2-${REMARK}"
-ATLS_NAME="atls-${REMARK}"
 echo -e "\n${GREEN}================================================================${PLAIN}"
 echo -e "${GREEN}🎉 双协议部署成功！(NAT VPS / 分离端口)${PLAIN}"
 echo -e "${GREEN}================================================================${PLAIN}"
-echo -e "  📍 服务器地址     : ${CYAN}${SERVER_IP}${PLAIN}"
-echo -e "  🏷  节点链接名     : ${CYAN}${HY_NAME} / ${ATLS_NAME}${PLAIN}"
-echo -e "  🔢 Hysteria2 端口 : ${CYAN}${HY_PORT}${PLAIN} (UDP)"
-echo -e "  🔢 AnyTLS 端口    : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
-echo -e "  🌐 伪装 SNI       : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
-echo -e "  🔐 Hy2 指纹       : ${CYAN}${PIN_SHA256}${PLAIN}"
+echo -e " 📍 节点名称      : ${CYAN}${NODE_TAG}${PLAIN}"
+echo -e " 📍 服务器地址    : ${CYAN}${SERVER_IP}${PLAIN}"
+echo -e " 🔢 Hysteria2 端口: ${CYAN}${HY_PORT}${PLAIN} (UDP)"
+echo -e " 🔢 AnyTLS 端口   : ${CYAN}${ATLS_PORT}${PLAIN} (TCP)"
+echo -e " 🌐 伪装 SNI      : ${CYAN}${OPTIMIZED_SNI}${PLAIN}"
+echo -e " 🔐 Hy2 指纹      : ${CYAN}${PIN_SHA256}${PLAIN}"
 echo -e "----------------------------------------------------------------"
-echo -e "  [1] Hysteria 2 (Gecko)"
-echo -e "      - 认证密码    : ${CYAN}${HY_PASS}${PLAIN}"
-echo -e "      - 混淆密码    : ${CYAN}${HY_OBFS_PASS}${PLAIN}"
+echo -e " [1] Hysteria 2 (Gecko)"
+echo -e "     - 认证密码 : ${CYAN}${HY_PASS}${PLAIN}"
+echo -e "     - 混淆密码 : ${CYAN}${HY_OBFS_PASS}${PLAIN}"
 echo -e "----------------------------------------------------------------"
 if [ "$INSTALL_ATLS" = "1" ]; then
-  echo -e "  [2] AnyTLS"
-  echo -e "      - 认证密码    : ${CYAN}${ATLS_PASS}${PLAIN}"
+  echo -e " [2] AnyTLS"
+  echo -e "     - 认证密码 : ${CYAN}${ATLS_PASS}${PLAIN}"
   echo -e "----------------------------------------------------------------"
 fi
 echo -e "${YELLOW}[Hysteria 2 直连链接]${PLAIN}"
-echo -e "${CYAN}hy2://${HY_PASS}@${HOST_F}:${HY_PORT}?pinSHA256=${PIN_SHA256}&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#${HY_NAME}${PLAIN}"
+echo -e "${CYAN}hy2://${HY_PASS}@${SERVER_IP}:${HY_PORT}?pinSHA256=${PIN_SHA256}&sni=${OPTIMIZED_SNI}&obfs=gecko&obfs-password=${HY_OBFS_PASS}#Hy2-${NODE_TAG}${PLAIN}"
 if [ "$INSTALL_ATLS" = "1" ]; then
   echo -e "\n${YELLOW}[AnyTLS 直连链接]${PLAIN}"
-  echo -e "${CYAN}anytls://${ATLS_PASS}@${HOST_F}:${ATLS_PORT}?sni=${OPTIMIZED_SNI}&insecure=1#${ATLS_NAME}${PLAIN}"
+  echo -e "${CYAN}anytls://${ATLS_PASS}@${SERVER_IP}:${ATLS_PORT}?sni=${OPTIMIZED_SNI}&insecure=1#AnyTLS-${NODE_TAG}${PLAIN}"
 fi
 echo -e "${GREEN}================================================================${PLAIN}"
 echo -e "${YELLOW}[NAT VPS 检查清单]${PLAIN}"
-echo -e "  1. 确认链接中的地址是服务商面板的入站 IP (不符则: hys setip <面板IP>)"
-echo -e "  2. 确认转发规则已放行 ${HY_PORT}/UDP 与 ${ATLS_PORT}/TCP"
-echo -e "  3. 若端口不在转发范围, 用 hys set 改到转发范围内"
-echo -e "  4. hy2 连不上时优先确认服务商是否转发 UDP"
+echo -e "  1. 确认服务商转发规则已放行 ${HY_PORT}/UDP 与 ${ATLS_PORT}/TCP"
+echo -e "  2. 若随机端口不在转发范围, 用 hys set 改到转发范围内"
+echo -e "  3. hy2 连不上时优先确认服务商是否转发 UDP"
 echo -e "${YELLOW}[后续管理命令]${PLAIN}"
-echo -e "  hys set hy2 <端口>      # 只改 Hysteria2 (UDP) 端口"
-echo -e "  hys set anytls <端口>   # 只改 AnyTLS (TCP) 端口"
-echo -e "  hys setip <IP>          # 修正分享链接中的服务器地址 (自动重算链接名)"
-echo -e "  hys info                # 查看当前配置与分享链接"
-echo -e "  hys restart / status    # 重启 / 状态"
+echo -e "  hys set hy2 <端口>     # 只改 Hysteria2 (UDP) 端口"
+echo -e "  hys set anytls <端口>  # 只改 AnyTLS (TCP) 端口"
+echo -e "  hys info               # 查看当前配置与分享链接"
+echo -e "  hys restart / status   # 重启 / 状态"
 echo -e "${GREEN}================================================================${PLAIN}"
